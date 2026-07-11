@@ -96,15 +96,40 @@ adversarial internet users at scale, this needs a real sandbox instead.
   sent anywhere except directly to Google's API as part of that user's
   own requests.
 
+### 6. Lesson persistence (`persistence.py`)
+
+Saved lessons are stored in a local SQLite file, keyed by a random
+client id kept in the page's URL (not a login, not a password -- see
+`persistence.py`'s module docstring and `ARCHITECTURE.md` for the full
+scope). Security-relevant properties:
+
+- **The client id is a bearer token, effectively.** Anyone who obtains
+  a copy of that URL (e.g. it's accidentally shared, logged by a
+  proxy, or shoulder-surfed) can view and delete that user's saved
+  lessons. Lessons are LeetCode approach notes, not secrets, but this
+  is still worth knowing before relying on the URL as if it were
+  private.
+- **The database file itself has no encryption at rest and no access
+  control beyond the host filesystem's own permissions.** On a shared
+  hosting environment, whoever can read the filesystem can read every
+  client's saved lessons.
+- **Best-effort only.** If the filesystem is read-only or the DB can't
+  be initialized, persistence silently disables itself and the app
+  falls back to session-only memory (the pre-persistence behavior) --
+  it does not crash and does not retry indefinitely.
+
 ## What's explicitly out of scope
 
 - **Multi-tenant isolation.** This app has no user accounts, no
-  per-user data isolation beyond Streamlit's session boundary. Anyone
-  with the app URL can use the shared free-tier keys (up to the rate
-  limits above).
-- **Persistence security.** There's nothing to secure at rest —
-  `lessons_memory` and problem history live only in server RAM for the
-  duration of a session and are never written to disk or a database.
+  per-user data isolation beyond Streamlit's session boundary (and, for
+  saved lessons, the URL-based client id described above). Anyone with
+  the app URL can use the shared free-tier keys (up to the rate limits
+  above).
+- **Persistence security beyond what's described above.** The SQLite
+  file has no encryption, no row-level access control, and no
+  protection beyond ordinary filesystem permissions. It is appropriate
+  for its actual job (surviving a tab refresh on a low-stakes personal
+  tool), not for storing anything sensitive.
 - **DoS resistance beyond the rate limiters described above.** A
   sufficiently large distributed flood is not something a single
   Streamlit process defends against; that's an infrastructure-layer

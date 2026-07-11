@@ -36,6 +36,7 @@ oversold itself):
   --network=none, or a hosted execution API), not this.
 """
 import ast
+import json
 import re
 import shutil
 import subprocess
@@ -46,22 +47,37 @@ from pathlib import Path
 TIMEOUT_SECONDS = 5
 MAX_EXAMPLES = 3
 
+# Pass 1 (primary): the "Input: ... Output: ..." shape, on one line or
+# across two lines. Covers the app's own example problems and most
+# pasted LeetCode problems.
 _EXAMPLE_RE = re.compile(
     r"input:\s*(?P<input>.*?)\s*(?:->\s*)?output:\s*(?P<output>.*?)"
     r"(?=\n\s*\n|\n\s*input:|\Z)",
     re.IGNORECASE | re.DOTALL,
 )
 
+# Pass 2 (fallback): "Example 1: nums = [2,7,11,15], target = 9, Output:
+# [0,1]" -- variable assignments given directly after "Example N:" with
+# no separate "Input:" label, just a trailing "Output:". Common in
+# problems pasted from sources that compress the Input: line away.
+_EXAMPLE_NO_INPUT_LABEL_RE = re.compile(
+    r"example\s*\d*\s*:\s*(?P<input>[a-zA-Z_]\w*\s*=.*?)\s*,?\s*output:\s*(?P<output>.*?)"
+    r"(?=\n\s*\n|\n\s*example\s*\d*\s*:|\Z)",
+    re.IGNORECASE | re.DOTALL,
+)
 
-def extract_examples(problem_text: str) -> list:
-    """Best-effort extraction of (input_str, output_str) pairs.
+# Pass 3 (fallback): the bare "assignments -> result" arrow shape with no
+# Input:/Output: labels at all (the shape this app's own quick-start
+# example problems use in their one-liner summaries).
+_EXAMPLE_ARROW_RE = re.compile(
+    r"(?P<input>[a-zA-Z_]\w*\s*=\s*.+?)\s*->\s*(?P<output>.+?)(?=\n|\Z)",
+    re.IGNORECASE,
+)
 
-    Returns a list of dicts: {"input": "...", "output": "..."}.
-    Empty list if nothing matched — callers must treat that as
-    "verification not possible", never as "verification passed".
-    """
+
+def _run_pass(pattern: re.Pattern, text: str) -> list:
     examples = []
-    for m in _EXAMPLE_RE.finditer(problem_text or ""):
+    for m in pattern.finditer(text or ""):
         inp = m.group("input").strip().strip(",")
         out = m.group("output").strip()
         # Trim trailing junk a greedy line-boundary miss could pull in.
@@ -71,6 +87,29 @@ def extract_examples(problem_text: str) -> list:
         if len(examples) >= MAX_EXAMPLES:
             break
     return examples
+
+
+def extract_examples(problem_text: str) -> list:
+    """Best-effort extraction of (input_str, output_str) pairs.
+
+    Tries progressively looser patterns until one matches: the standard
+    "Input: ... Output: ..." shape first, then "Example N: <assignments>,
+    Output: ..." (no separate Input: label), then a bare "<assignments> ->
+    <result>" arrow shape. Stops at the first pass that finds anything,
+    rather than combining passes, to keep results predictable -- once a
+    problem's format is recognized, later looser passes won't also fire
+    and produce noisy duplicate/conflicting matches.
+
+    Returns a list of dicts: {"input": "...", "output": "..."}.
+    Empty list if nothing matched — callers must treat that as
+    "verification not possible", never as "verification passed".
+    """
+    text = problem_text or ""
+    for pattern in (_EXAMPLE_RE, _EXAMPLE_NO_INPUT_LABEL_RE, _EXAMPLE_ARROW_RE):
+        examples = _run_pass(pattern, text)
+        if examples:
+            return examples
+    return []
 
 
 def _to_python_literal(raw: str):
@@ -108,13 +147,20 @@ def _parse_assignments(input_str: str) -> dict:
 
 
 def _infer_python_method(code: str):
-    """Finds the first method on `class Solution` and its parameter names."""
-    m = re.search(r"class\s+Solution\b.*?def\s+(\w+)\s*\(self,\s*([^)]*)\)", code, re.DOTALL)
+    """Finds the first method on `class Solution` and its parameter names.
+
+    The parameter group after `self` is optional -- a method with no
+    other parameters (e.g. `def isPalindrome(self):`) previously failed
+    to match at all (the regex required a literal comma after `self`),
+    silently falling through to "couldn't be matched to the solution's
+    parameters" with no indication the regex itself was the problem.
+    """
+    m = re.search(r"class\s+Solution\b.*?def\s+(\w+)\s*\(self\s*(?:,\s*([^)]*))?\)", code, re.DOTALL)
     if not m:
         return None
     method_name = m.group(1)
     params = []
-    for p in m.group(2).split(","):
+    for p in (m.group(2) or "").split(","):
         p = p.strip()
         if not p:
             continue
@@ -234,10 +280,17 @@ def _run_js_example(code: str, example: dict, tmpdir: Path) -> dict:
     solution_path = tmpdir / "solution.js"
     solution_path.write_text(export_code)
 
+    # json.dumps produces valid JS-literal-compatible JSON regardless of
+    # what characters appear in the value (quotes, apostrophes, unicode,
+    # etc). The previous approach -- repr() a Python list, then
+    # string-replace single quotes with double quotes -- broke on any
+    # string value containing an apostrophe (e.g. "it's a test"), turning
+    # ['it\'s a test'] into the invalid JS ["it"s a test"] and crashing
+    # the harness with a SyntaxError. json.dumps escapes correctly instead.
     harness_code = _JS_HARNESS_TEMPLATE.format(
         solution_path="./solution.js",
-        input_json=list(assignments.values()).__repr__().replace("'", '"').replace("True", "true").replace("False", "false").replace("None", "null"),
-        expected_json=repr(expected).replace("'", '"').replace("True", "true").replace("False", "false").replace("None", "null"),
+        input_json=json.dumps(list(assignments.values())),
+        expected_json=json.dumps(expected),
     )
     harness_path = tmpdir / "harness.js"
     harness_path.write_text(harness_code)

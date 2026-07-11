@@ -45,3 +45,21 @@ def test_global_limiter_is_shared_state_not_per_call():
     caller_b_allowed = limiter.allow()
     assert caller_a_allowed is True
     assert caller_b_allowed is False
+
+
+def test_ratelimiter_would_allow_does_not_mutate():
+    rl = RateLimiter(max_calls=1, window_seconds=60)
+    assert rl.would_allow() is True
+    assert rl.would_allow() is True  # peeking repeatedly doesn't consume
+    assert len(rl.calls) == 0
+    assert rl.allow() is True
+    assert rl.would_allow() is False  # now actually consumed
+
+
+def test_global_limiter_would_allow_does_not_mutate():
+    limiter = GlobalRateLimiter(daily_budget=1)
+    assert limiter.would_allow() is True
+    assert limiter.would_allow() is True  # peeking repeatedly doesn't consume
+    assert limiter.remaining() == 1
+    assert limiter.allow() is True
+    assert limiter.would_allow() is False

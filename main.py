@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 from logger import log
 import styles
 from ai_client import (
-    call_ai, build_solve_prompt,
+    call_ai, call_ai_stream, build_solve_prompt,
     build_fix_prompt,
     build_pedagogical_hint_prompt, build_code_review_prompt,
     build_socratic_question_prompt, build_socratic_feedback_prompt,
@@ -21,16 +21,17 @@ from response_parser import (
 )
 from code_verifier import verify_solution
 from lesson_memory import build_lesson
+import persistence
 from app_helpers import (
-    MAX_PROBLEM_CHARS, MAX_CODE_CHARS, SESSION_AI_CALL_LIMIT,
+    MAX_PROBLEM_CHARS, MAX_CODE_CHARS, MAX_LESSONS_IN_MEMORY, MAX_ATTEMPT_ERRORS,
     _enforce_server_side_length, _get_user_code_capped,
-    _check_session_limit, _increment_session_calls, _show_session_limit_warning,
-    _check_global_limit, _get_lessons_context, _show_error,
+    _get_lessons_context, _show_error, _show_session_limit_warning,
+    check_and_consume_rate_limits,
 )
 
 load_dotenv()
 
-st.set_page_config(page_title="CodeUnfold", page_icon="🤖", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="CodeUnfold", page_icon="🤖", layout="wide", initial_sidebar_state="auto")
 
 # ---------- CSS ----------
 st.markdown(styles.BASE_CSS, unsafe_allow_html=True)
@@ -39,16 +40,26 @@ st.markdown(styles.BASE_CSS, unsafe_allow_html=True)
 # Initialize AI clients on start
 _default_gemini, _groq_client = get_clients()
 
-if not _default_gemini and not _groq_client:
+if "fallback_user_key" not in st.session_state:
+    st.session_state.fallback_user_key = ""
+
+if not _default_gemini and not _groq_client and not st.session_state.fallback_user_key:
     st.error("🔑 No API keys configured. The app can't function without at least one.")
     st.markdown("""
-    **Get a free Groq key in 30 seconds (recommended):**
-    1. Go to [console.groq.com](https://console.groq.com)
+    **Get a free Gemini key in 30 seconds (recommended -- works instantly below, no restart needed):**
+    1. Go to [aistudio.google.com/apikey](https://aistudio.google.com/apikey)
     2. Sign in → Create API Key → Copy it
-    3. Paste it below or add it to your `.env` file as `GROQ_API_KEY`
+    3. Paste it below to continue right now, or add it to your `.env` file as `GEMINI_API_KEY` to make it the default for everyone.
+
+    *(A Groq key only works via `.env`/secrets, not pasted here -- Groq has no per-request key override the way Gemini does.)*
     """)
-    user_key_setup = st.text_input("Paste your Groq or Gemini API key here to continue:", type="password")
+    typed_key = st.text_input("Paste your Gemini API key here to continue:", type="password", key="_fallback_key_widget")
+    if typed_key:
+        st.session_state.fallback_user_key = typed_key
+        st.rerun()
     st.stop()
+elif not _default_gemini and not _groq_client:
+    st.sidebar.success("✅ Using your pasted Gemini key for this session.")
 elif not _default_gemini:
     st.sidebar.warning("⚠️ Gemini key not set. Using Groq only.")
 elif not _groq_client:
@@ -68,9 +79,11 @@ _defaults = {
     "language": "Python",
     "user_code": "",
     "socratic_mode": False,
+    "socratic_max_turns": SOCRATIC_MAX_TURNS,
     "socratic_conversation": [],
     "socratic_pending_question": None,
     "socratic_done": False,
+    "privacy_notice_shown": False,
 }
 for key, default in _defaults.items():
     if key not in st.session_state:
@@ -79,7 +92,26 @@ for key, default in _defaults.items():
 if "ai_limiter" not in st.session_state:
     st.session_state.ai_limiter = RateLimiter(max_calls=15, window_seconds=60)
     st.session_state.session_ai_calls = 0  # Per-visitor cap counter
-    st.session_state.lessons_memory = []  # Ephemeral memory for this session
+
+    # Best-effort persistence: identify this browser by a random id kept
+    # in the URL's query params (survives a tab refresh, since the URL
+    # does; does NOT survive opening a fresh tab without that URL, and
+    # is not a real account system -- see persistence.py's docstring for
+    # the full scope/limitations). If the DB can't be initialized (e.g.
+    # a read-only filesystem on some container platforms), persistence
+    # silently degrades to the old session-only behavior.
+    client_id = st.query_params.get("cid")
+    if not client_id:
+        client_id = persistence.new_client_id()
+        st.query_params["cid"] = client_id
+    st.session_state.client_id = client_id
+
+    db_path = persistence.get_db_path()
+    st.session_state.persistence_available = persistence.init_db(db_path)
+    if st.session_state.persistence_available:
+        st.session_state.lessons_memory = persistence.load_lessons_from_db(db_path, client_id)
+    else:
+        st.session_state.lessons_memory = []
 
 def _reset_problem_state():
     """Clears everything derived from the current problem/language/code.
@@ -101,6 +133,42 @@ def _sync_language():
     _reset_problem_state()
     st.session_state.user_code = ""
 
+def _call_ai(prompt: str, user_key: str = None) -> str:
+    """Thin Streamlit-rendering wrapper around ai_client.call_ai().
+
+    call_ai() itself never touches Streamlit (so it stays usable outside
+    a Streamlit runtime -- unit tests, a future CLI, etc.); this is the
+    one place that takes its AIResult and renders the provider caption
+    and any notices into the sidebar, the way the rest of this app
+    expects to see them.
+    """
+    result = call_ai(prompt, user_key)
+    for level, message in result.notices:
+        if level == "warning":
+            st.sidebar.warning(message)
+        else:
+            st.sidebar.caption(message)
+    st.sidebar.caption(f"🤖 Answered by: `{result.provider}`")
+    return result.text
+
+
+def _call_ai_streamed(prompt: str, user_key: str = None) -> str:
+    """Streaming counterpart to _call_ai(): renders the response
+    progressively via st.write_stream() instead of showing a bare
+    spinner with nothing visible until the whole multi-second response
+    arrives. Used only for the highest-frequency, highest-latency call
+    sites (Solve, standard Hints) -- see ai_client.call_ai_stream()'s
+    docstring for the fallback-order and scope rationale.
+
+    Unlike _call_ai(), this doesn't know which provider answered until
+    after the fact (there's no single result object mid-stream), so it
+    doesn't render a "Answered by" sidebar caption. Errors propagate
+    exactly as they do from _call_ai() -- callers already wrap AI calls
+    in try/except and route failures through _show_error().
+    """
+    return st.write_stream(call_ai_stream(prompt, user_key))
+
+
 def _trigger_fix_loop(prob_text: str, errors: list, user_key: str = None):
     error_history = "\n".join(f"Error #{i + 1}:\n{e}" for i, e in enumerate(errors))
     code_to_fix = st.session_state.raw_code or "(code unavailable)"
@@ -110,27 +178,17 @@ def _trigger_fix_loop(prob_text: str, errors: list, user_key: str = None):
         st.session_state.language, _get_lessons_context(prob_text)
     )
     
-    if not _check_session_limit(user_key):
-        st.warning(f"💡 You've used all {SESSION_AI_CALL_LIMIT} free AI calls for this session. Add your own free Gemini API key in ⚙️ **Settings** in the sidebar for unlimited access.")
-        return
-    if not st.session_state.ai_limiter.allow():
-        st.error("Too many requests! Please wait a moment.")
-        return
-    if not _check_global_limit(user_key):
-        st.error(
-            "🛑 This app has hit its shared daily AI quota (protecting the free Groq/Gemini keys "
-            "everyone shares). Add your own free Gemini API key in ⚙️ **Settings** for unlimited access, "
-            "or try again after the daily reset."
-        )
+    allowed, limit_msg = check_and_consume_rate_limits(user_key)
+    if not allowed:
+        st.error(limit_msg)
         return
 
     with st.spinner("Analyzing error and generating fix..."):
         try:
             old_code = st.session_state.raw_code
             t0 = time.time()
-            new_text = call_ai(fix_prompt, user_key)
+            new_text = _call_ai(fix_prompt, user_key)
             t1 = time.time()
-            _increment_session_calls()
             
             # Extract the main solution code robustly via XML tags
             st.session_state.raw_code = extract_code_block(new_text)
@@ -195,14 +253,30 @@ with st.sidebar:
         key="socratic_mode",
         help="When on, 'Get Hints' asks you one guiding question at a time instead of showing everything at once. Answer a couple of rounds and it converges into the full hint breakdown.",
     )
+    if st.session_state.socratic_mode:
+        st.slider(
+            "Socratic rounds before showing full hints",
+            min_value=1, max_value=5, key="socratic_max_turns",
+            help="How many question-and-answer rounds before converging into the full hint breakdown.",
+        )
 
     with st.expander("🔑 API Settings", expanded=False):
-        user_gemini_key = st.text_input("Your Gemini API Key (Optional)", type="password")
+        user_gemini_key = st.text_input(
+            "Your Gemini API Key (Optional)", type="password",
+            value=st.session_state.get("fallback_user_key", ""),
+        )
         if user_gemini_key:
             st.toast("Using your personal Gemini key!", icon="✅")
     
     with st.expander("🧠 Session Memory", expanded=True):
-        st.caption("Lessons save for this session. Persist longer by self-hosting.")
+        if st.session_state.get("persistence_available"):
+            st.caption(
+                "Lessons are saved to this browser via a link in the URL -- bookmark this page's "
+                "URL to keep them across a refresh. Opening the app in a new tab without that URL "
+                "starts fresh. This isn't an account system; see SECURITY.md for the full scope."
+            )
+        else:
+            st.caption("Lessons save for this browser session only (persistence unavailable on this deployment).")
         # Read the structured records directly rather than round-tripping
         # through the formatted prompt-context string (which was fragile
         # to parse back apart, e.g. if a takeaway itself contained a line
@@ -213,6 +287,11 @@ with st.sidebar:
                 tag_prefix = f"`{', '.join(lesson['tags'])}` " if lesson.get("tags") else ""
                 summary = f"{lesson['title']}: {lesson['takeaway']}"
                 st.caption(f"• {tag_prefix}{summary[:60]}{'...' if len(summary) > 60 else ''}")
+            if st.button("🗑️ Forget my saved lessons", use_container_width=True):
+                st.session_state.lessons_memory = []
+                if st.session_state.get("persistence_available"):
+                    persistence.delete_client_lessons(persistence.get_db_path(), st.session_state.client_id)
+                st.rerun()
         else:
             st.caption("No lessons yet.")
 
@@ -242,7 +321,7 @@ with st.form("input_form"):
     st.text_area(
         "Paste your coding problem here:",
         height=150,
-        max_chars=5000,
+        max_chars=MAX_PROBLEM_CHARS,
         key="_problem_widget",
         placeholder="Paste problem description + starter code template...\n\nTip: Include both the problem AND the starter code for best results.",
         label_visibility="collapsed"
@@ -251,7 +330,7 @@ with st.form("input_form"):
     st.text_area(
         "Your Current Code (Optional):",
         height=150,
-        max_chars=5000,
+        max_chars=MAX_CODE_CHARS,
         key="user_code",
         placeholder="Paste your current attempt here if you want a code review instead of generic hints...",
         label_visibility="visible"
@@ -277,9 +356,22 @@ if hint_button or solve_button:
     # directly in the same run. Its length is enforced instead at the
     # point of use, via `_get_user_code_capped()` below.
     new_text = _enforce_server_side_length(st.session_state._problem_widget, MAX_PROBLEM_CHARS)
+    if len(st.session_state._problem_widget or "") > MAX_PROBLEM_CHARS:
+        st.warning(
+            f"⚠️ Your problem text was over {MAX_PROBLEM_CHARS:,} characters and got trimmed to fit. "
+            "If the trimmed part included the examples or constraints, the AI may misunderstand the problem."
+        )
     if new_text != st.session_state.problem_text:
         st.session_state.problem_text = new_text
         _reset_problem_state()
+
+    if new_text and not st.session_state.get("privacy_notice_shown"):
+        st.session_state.privacy_notice_shown = True
+        st.toast(
+            "🔒 Your problem text is sent to Groq/Gemini to generate a response. "
+            "Avoid pasting proprietary or confidential code.",
+            icon="🔒",
+        )
 
 problem_text = st.session_state.problem_text
 
@@ -328,24 +420,16 @@ if hint_button and problem_text:
         st.rerun()  # Already generated, just display
     if st.session_state.socratic_pending_question and not st.session_state.socratic_done:
         st.rerun()  # Socratic exchange already in progress, don't restart it
-    if not _check_session_limit(user_gemini_key):
-        st.warning(f"💡 You've used all {SESSION_AI_CALL_LIMIT} free AI calls for this session. Add your own free Gemini API key in ⚙️ **Settings** in the sidebar for unlimited access.")
-        st.stop()
-    if not st.session_state.ai_limiter.allow():
-        st.error("⏳ Too many requests! Please wait a moment.")
-        st.stop()
-    if not _check_global_limit(user_gemini_key):
-        st.error(
-            "🛑 This app has hit its shared daily AI quota (protecting the free Groq/Gemini keys "
-            "everyone shares). Add your own free Gemini API key in ⚙️ **Settings** for unlimited access, "
-            "or try again after the daily reset."
-        )
+    allowed, limit_msg = check_and_consume_rate_limits(user_gemini_key)
+    if not allowed:
+        st.error(limit_msg)
         st.stop()
     _show_session_limit_warning()
         
     user_code_capped = _get_user_code_capped()
+    use_streaming = False
     if user_code_capped and len(user_code_capped.strip()) > 5:
-        hint_prompt = build_code_review_prompt(problem_text, user_code_capped, st.session_state.language)
+        hint_prompt = build_code_review_prompt(problem_text, user_code_capped, st.session_state.language, _get_lessons_context(problem_text))
         spinner_msg = "Reviewing your code..."
     elif st.session_state.socratic_mode:
         # Socratic mode: ask one diagnostic question instead of the full
@@ -354,8 +438,7 @@ if hint_button and problem_text:
         # follow-up interaction rather than this initial button click.
         try:
             with st.spinner("Thinking of a question to ask you..."):
-                q_result = call_ai(build_socratic_question_prompt(problem_text, st.session_state.language), user_gemini_key)
-            _increment_session_calls()
+                q_result = _call_ai(build_socratic_question_prompt(problem_text, st.session_state.language, _get_lessons_context(problem_text)), user_gemini_key)
             question = extract_socratic_question(q_result)
             if question:
                 st.session_state.socratic_pending_question = question
@@ -365,10 +448,9 @@ if hint_button and problem_text:
             else:
                 # Model didn't follow the format -- fall back to the
                 # standard hint flow rather than showing a dead end.
-                hint_prompt = build_pedagogical_hint_prompt(problem_text, st.session_state.language)
+                hint_prompt = build_pedagogical_hint_prompt(problem_text, st.session_state.language, _get_lessons_context(problem_text))
                 with st.spinner("Analyzing problem and generating hints..."):
-                    result = call_ai(hint_prompt, user_gemini_key)
-                _increment_session_calls()
+                    result = _call_ai(hint_prompt, user_gemini_key)
                 st.session_state.current_hints = result
                 st.session_state.current_solution = None
                 st.rerun()
@@ -376,17 +458,21 @@ if hint_button and problem_text:
             _show_error(e, "Socratic question generation")
         st.stop()
     else:
-        hint_prompt = build_pedagogical_hint_prompt(problem_text, st.session_state.language)
+        hint_prompt = build_pedagogical_hint_prompt(problem_text, st.session_state.language, _get_lessons_context(problem_text))
         spinner_msg = "Analyzing problem and generating hints..."
+        use_streaming = True
         
     try:
-        with st.spinner(spinner_msg):
-            t0 = time.time()
-            result = call_ai(hint_prompt, user_gemini_key)
-            t1 = time.time()
+        t0 = time.time()
+        if use_streaming:
+            st.markdown(f"### 💡 Hints & Strategy — {spinner_msg}")
+            result = _call_ai_streamed(hint_prompt, user_gemini_key)
+        else:
+            with st.spinner(spinner_msg):
+                result = _call_ai(hint_prompt, user_gemini_key)
+        t1 = time.time()
                 
         result += f"\n\n---\n*⏱️ Hints generated in {t1-t0:.1f}s*"
-        _increment_session_calls()
         st.session_state.current_hints = result
         st.session_state.current_solution = None
         st.rerun()
@@ -397,18 +483,9 @@ elif solve_button and problem_text:
     log.info(f"User Action: Reveal Solution - Language: {st.session_state.language}")
     if st.session_state.current_solution:
         st.rerun()  # Already generated, just display
-    if not _check_session_limit(user_gemini_key):
-        st.warning(f"💡 You've used all {SESSION_AI_CALL_LIMIT} free AI calls for this session. Add your own free Gemini API key in ⚙️ **Settings** in the sidebar for unlimited access.")
-        st.stop()
-    if not st.session_state.ai_limiter.allow():
-        st.error("⏳ Too many requests! Please wait a moment.")
-        st.stop()
-    if not _check_global_limit(user_gemini_key):
-        st.error(
-            "🛑 This app has hit its shared daily AI quota (protecting the free Groq/Gemini keys "
-            "everyone shares). Add your own free Gemini API key in ⚙️ **Settings** for unlimited access, "
-            "or try again after the daily reset."
-        )
+    allowed, limit_msg = check_and_consume_rate_limits(user_gemini_key)
+    if not allowed:
+        st.error(limit_msg)
         st.stop()
 
     st.session_state.attempt_errors = []
@@ -417,13 +494,12 @@ elif solve_button and problem_text:
     solve_prompt = build_solve_prompt(problem_text, st.session_state.language, _get_lessons_context(problem_text))
     
     try:
-        with st.spinner(f"Generating {st.session_state.language} lesson..."):
-            t0 = time.time()
-            result = call_ai(solve_prompt, user_gemini_key)
-            t1 = time.time()
+        t0 = time.time()
+        st.markdown(f"### 📖 Generating your {st.session_state.language} lesson...")
+        result = _call_ai_streamed(solve_prompt, user_gemini_key)
+        t1 = time.time()
 
         result = result + f"\n\n---\n*⏱️ Lesson generated in {t1-t0:.1f}s*"
-        _increment_session_calls()
         st.session_state.raw_code = extract_code_block(result)
 
         # Actually run the extracted code against the example(s) in the
@@ -450,7 +526,7 @@ if st.session_state.socratic_pending_question and not st.session_state.socratic_
         st.markdown(f"**Problem:** {problem_text[:80]}...")
     with st.chat_message("assistant", avatar="🤖"):
         turn_number = len(st.session_state.socratic_conversation) + 1
-        st.markdown(f"### 🧠 Socratic Hint — Round {turn_number} of {SOCRATIC_MAX_TURNS}")
+        st.markdown(f"### 🧠 Socratic Hint — Round {turn_number} of {st.session_state.socratic_max_turns}")
         for past in st.session_state.socratic_conversation:
             st.markdown(f"**Q:** {past['question']}")
             st.caption(f"Your answer: {past['answer']}")
@@ -464,13 +540,13 @@ if st.session_state.socratic_pending_question and not st.session_state.socratic_
         skip_socratic = col_b.button("⏭️ Just show me the full hints", use_container_width=True, key="socratic_skip")
 
         if skip_socratic:
-            if not _check_global_limit(user_gemini_key) or not st.session_state.ai_limiter.allow():
-                st.error("⏳ Rate limited — please wait a moment and try again.")
+            allowed, limit_msg = check_and_consume_rate_limits(user_gemini_key)
+            if not allowed:
+                st.error(limit_msg)
                 st.stop()
             try:
                 with st.spinner("Analyzing problem and generating hints..."):
-                    result = call_ai(build_pedagogical_hint_prompt(problem_text, st.session_state.language), user_gemini_key)
-                _increment_session_calls()
+                    result = _call_ai(build_pedagogical_hint_prompt(problem_text, st.session_state.language, _get_lessons_context(problem_text)), user_gemini_key)
                 st.session_state.current_hints = result
                 st.session_state.current_solution = None
                 st.session_state.socratic_pending_question = None
@@ -482,23 +558,25 @@ if st.session_state.socratic_pending_question and not st.session_state.socratic_
         if submit_answer:
             if not answer.strip():
                 st.warning("Type an answer first (even a guess is fine!).")
-            elif not _check_global_limit(user_gemini_key) or not st.session_state.ai_limiter.allow():
-                st.error("⏳ Rate limited — please wait a moment and try again.")
             else:
+                allowed, limit_msg = check_and_consume_rate_limits(user_gemini_key)
+                if not allowed:
+                    st.error(limit_msg)
+                    st.stop()
                 answer_capped = _enforce_server_side_length(answer.strip(), MAX_CODE_CHARS)
-                is_final_turn = turn_number >= SOCRATIC_MAX_TURNS
+                is_final_turn = turn_number >= st.session_state.socratic_max_turns
                 conversation_so_far = st.session_state.socratic_conversation + [
                     {"question": st.session_state.socratic_pending_question, "answer": answer_capped}
                 ]
                 try:
                     with st.spinner("Reading your answer..."):
-                        fb_result = call_ai(
+                        fb_result = _call_ai(
                             build_socratic_feedback_prompt(
-                                problem_text, st.session_state.language, conversation_so_far, is_final_turn
+                                problem_text, st.session_state.language, conversation_so_far, is_final_turn,
+                                _get_lessons_context(problem_text),
                             ),
                             user_gemini_key,
                         )
-                    _increment_session_calls()
                     parsed = extract_socratic_followup(fb_result)
 
                     if parsed is None:
@@ -611,18 +689,34 @@ if st.session_state.current_solution:
             if st.button("Undo (Remove from Memory)"):
                 if st.session_state.lessons_memory:
                     st.session_state.lessons_memory.pop()
+                if st.session_state.get("persistence_available"):
+                    persistence.delete_last_lesson(persistence.get_db_path(), st.session_state.client_id)
                 st.session_state.lesson_saved = False
                 st.rerun()
         else:
             if st.button("💾 Save this approach to memory", use_container_width=True):
                 sol_text = st.session_state.current_solution
                 takeaway_text = extract_tag(sol_text, "takeaway") or "Saved solution approach."
-                
-                # Prepend the problem title (first line of problem text) to give context
-                title = problem_text.split('\n')[0][:50] if problem_text else "Unknown Problem"
+
+                # Prefer the model's own <title> tag (e.g. "Two Sum") over
+                # guessing from the pasted problem text -- the first 50
+                # chars of the first line is often just "Given an array
+                # of integers nums..." with no useful information. Fall
+                # back to that heuristic only if the model didn't emit one.
+                title = extract_tag(sol_text, "title") or (
+                    problem_text.split('\n')[0][:50] if problem_text else "Unknown Problem"
+                )
                 lesson = build_lesson(title, takeaway_text, problem_text, st.session_state.language)
-                
-                st.session_state.lessons_memory.append(lesson)
+
+                lessons = st.session_state.lessons_memory
+                lessons.append(lesson)
+                # Cap in-memory growth: a long multi-hour session could
+                # otherwise accumulate an unbounded list (each lesson
+                # holds a full takeaway string). FIFO evict the oldest.
+                if len(lessons) > MAX_LESSONS_IN_MEMORY:
+                    del lessons[: len(lessons) - MAX_LESSONS_IN_MEMORY]
+                if st.session_state.get("persistence_available"):
+                    persistence.save_lesson_to_db(persistence.get_db_path(), st.session_state.client_id, lesson)
                 st.session_state.lesson_saved = True
                 st.balloons()
                 st.rerun()
@@ -638,5 +732,5 @@ if st.session_state.current_solution:
                 else:
                     trimmed = _enforce_server_side_length(error_input.strip(), MAX_CODE_CHARS)
                     st.session_state.attempt_errors.append(trimmed)
-                    st.session_state.attempt_errors = st.session_state.attempt_errors[-3:]
+                    st.session_state.attempt_errors = st.session_state.attempt_errors[-MAX_ATTEMPT_ERRORS:]
                     _trigger_fix_loop(problem_text, st.session_state.attempt_errors, user_gemini_key)

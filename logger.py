@@ -1,5 +1,6 @@
 import logging
 import os
+from logging.handlers import RotatingFileHandler
 
 def setup_logging():
     logger = logging.getLogger('codeunfold')
@@ -14,9 +15,14 @@ def setup_logging():
         # here would crash the entire app before a single page loads.
         # Console logging alone is still useful (most platforms capture
         # stdout/stderr), so fall back to that instead of failing hard.
+        #
+        # RotatingFileHandler (not plain FileHandler) caps the log at
+        # 1MB with 3 rotated backups (~4MB total ceiling) -- a plain
+        # FileHandler has no size limit at all, so a popular long-running
+        # deployment would otherwise grow codeunfold.log without bound.
         try:
             log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'codeunfold.log')
-            fh = logging.FileHandler(log_file)
+            fh = RotatingFileHandler(log_file, maxBytes=1_000_000, backupCount=3)
             fh.setFormatter(formatter)
             logger.addHandler(fh)
         except OSError:

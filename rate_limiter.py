@@ -26,6 +26,20 @@ class RateLimiter:
         self.calls.append(now)
         return True
 
+    def would_allow(self) -> bool:
+        """Non-mutating peek: would the next call() succeed right now?
+
+        Exists so multiple rate limiters can be checked in sequence
+        before any of them are actually consumed -- without this, a
+        request that passes this limiter but then gets blocked by a
+        *different* limiter checked afterward would still have consumed
+        one of this limiter's slots for a request that never went
+        through.
+        """
+        now = time.time()
+        current_calls = [t for t in self.calls if now - t < self.window]
+        return len(current_calls) < self.max_calls
+
 
 class GlobalRateLimiter:
     """Process-wide daily token bucket shared across every visitor session.
@@ -73,3 +87,7 @@ class GlobalRateLimiter:
         with self._lock:
             self._roll_day_if_needed()
             return max(0, self.daily_budget - self._count)
+
+    def would_allow(self) -> bool:
+        """Non-mutating peek -- see RateLimiter.would_allow() for why this exists."""
+        return self.remaining() > 0

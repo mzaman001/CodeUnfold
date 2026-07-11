@@ -23,7 +23,7 @@ pip install -r requirements.txt -r requirements-dev.txt
 
 ```bash
 python3 -m py_compile main.py ai_client.py rate_limiter.py response_parser.py \
-    code_verifier.py logger.py app_helpers.py styles.py lesson_memory.py
+    code_verifier.py logger.py app_helpers.py styles.py lesson_memory.py persistence.py
 ruff check .
 pytest -v
 ```
@@ -84,6 +84,25 @@ GROQ_API_KEY=fake GEMINI_API_KEY=fake timeout 8 streamlit run main.py \
   `execution_output`, `last_saved_lesson_text/id` — all removed). If you
   add a session-state key, make sure something actually reads it, or
   don't add it.
+- **`ai_client.call_ai()` must never import or call into Streamlit.**
+  It used to call `st.sidebar.caption()`/`st.sidebar.warning()`
+  directly, which coupled it to a Streamlit runtime and made it
+  untestable without one. It now returns an `AIResult(text, provider,
+  notices)` namedtuple; `main.py`'s `_call_ai()` wrapper is the one
+  place that renders `notices` into the sidebar. If you need to surface
+  something to the user from inside `call_ai()`, add it to `notices`,
+  don't reach for `st.*`. `tests/test_ai_client.py::test_call_ai_never_touches_streamlit`
+  enforces this by inspecting the function's source.
+- **Every AI-call site must go through `app_helpers.check_and_consume_rate_limits()`**,
+  not ad-hoc combinations of the three limiters. Before this was
+  consolidated, different buttons checked different subsets of
+  (per-session cap, sliding window, global daily budget) in different
+  orders, which both wasted budget (a request blocked by one limiter
+  still consumed a slot from another, checked-and-mutated-first
+  limiter) and let one button (the Socratic "skip" button) bypass the
+  per-session cap entirely. If you add a new AI-call site, call this
+  function first and bail out on `allowed=False` — don't write a new
+  check sequence.
 
 ## Style
 
