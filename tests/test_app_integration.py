@@ -89,6 +89,7 @@ def test_solve_button_with_mocked_streaming_response_produces_final_solution(mon
         "<problem_statement>Find two numbers that sum to target</problem_statement>"
         "<key_idea>Use a hash map for O(1) lookups</key_idea>"
         "<approach>Iterate once, checking complements</approach>"
+        "<worked_example>i=0: nums[0]=2, complement=7, not seen, remember 2. i=1: nums[1]=7, complement=2, seen at 0, return [0,1]</worked_example>"
         "<code>```python\nclass Solution:\n    def twoSum(self, nums, target):\n        seen = {}\n        "
         "for i, n in enumerate(nums):\n            if target - n in seen:\n                return [seen[target - n], i]\n            "
         "seen[n] = i\n        return []\n```</code>"
@@ -148,7 +149,7 @@ def test_fix_loop_end_to_end_with_stubbed_response(monkeypatch):
 
     fixed_code_response = (
         "<problem_statement>Two Sum</problem_statement>"
-        "<key_idea>x</key_idea><approach>x</approach>"
+        "<key_idea>x</key_idea><approach>x</approach><worked_example>x</worked_example>"
         "<code>```python\nclass Solution:\n    def twoSum(self, nums, target):\n        seen = {}\n        "
         "for i, n in enumerate(nums):\n            if target - n in seen:\n                return [seen[target - n], i]\n            "
         "seen[n] = i\n        return []\n```</code>"
@@ -173,7 +174,7 @@ def test_fix_loop_end_to_end_with_stubbed_response(monkeypatch):
         "class Solution:\n    def twoSum(self, nums, target):\n        return [99, 99]\n"
     )
     at.session_state["current_solution"] = (
-        "<problem_statement>Two Sum</problem_statement><key_idea>x</key_idea><approach>x</approach>"
+        "<problem_statement>Two Sum</problem_statement><key_idea>x</key_idea><approach>x</approach><worked_example>x</worked_example>"
         "<code>```python\nclass Solution:\n    def twoSum(self, nums, target):\n        return [99, 99]\n```</code>"
         "<explanation>x</explanation><complexity>x</complexity><takeaway>x</takeaway>"
     )
@@ -220,7 +221,7 @@ def test_fix_loop_respects_session_call_cap(monkeypatch):
     at.session_state["problem_text"] = at.session_state["_problem_widget"]
     at.session_state["raw_code"] = "class Solution:\n    def twoSum(self, nums, target):\n        return []\n"
     at.session_state["current_solution"] = (
-        "<problem_statement>x</problem_statement><key_idea>x</key_idea><approach>x</approach>"
+        "<problem_statement>x</problem_statement><key_idea>x</key_idea><approach>x</approach><worked_example>x</worked_example>"
         "<code>```python\nx\n```</code><explanation>x</explanation><complexity>x</complexity><takeaway>x</takeaway>"
     )
     at.session_state["session_ai_calls"] = 5  # SESSION_AI_CALL_LIMIT, already exhausted
@@ -236,6 +237,88 @@ def test_fix_loop_respects_session_call_cap(monkeypatch):
     # raw_code must be unchanged -- the fix call should have been blocked
     # before ever reaching call_ai.
     assert at.session_state["raw_code"] == "class Solution:\n    def twoSum(self, nums, target):\n        return []\n"
+
+
+def test_switching_problems_preserves_previous_solution_in_history():
+    """Regression test for the reported bug: switching to a new problem
+    (or accidentally clicking hints/solve/fix again) used to silently
+    discard the previous problem's generated solution/hints with no way
+    to get it back. Confirms the previous problem is snapshotted into
+    problem_history before the switch takes effect.
+    """
+    at = _fresh_app()
+
+    problem_a = "Example: Input: nums = [2,7,11,15], target = 9 -> Output: [0,1]"
+    problem_box = next(w for w in at.text_area if w.key == "_problem_widget")
+    problem_box.set_value(problem_a)
+    at.run()
+    at.session_state["problem_text"] = at.session_state["_problem_widget"]
+    at.session_state["current_solution"] = (
+        "<title>Two Sum</title><problem_statement>x</problem_statement><key_idea>x</key_idea>"
+        "<approach>x</approach><worked_example>x</worked_example><code>```python\nx\n```</code>"
+        "<explanation>x</explanation><complexity>x</complexity><takeaway>x</takeaway>"
+    )
+    at.session_state["raw_code"] = "class Solution: pass"
+    at.run()
+    assert not at.exception
+
+    # Switch to a different problem.
+    problem_b = 'Example: Input: s = "()[]{}" -> Output: true'
+    problem_box = next(w for w in at.text_area if w.key == "_problem_widget")
+    problem_box.set_value(problem_b)
+    solve_btn = next(b for b in at.button if "Reveal Solution" in (b.label or ""))
+    solve_btn.click().run()
+    assert not at.exception
+
+    history = at.session_state["problem_history"]
+    assert len(history) == 1
+    saved_entry = list(history.values())[0]
+    assert saved_entry["title"] == "Two Sum"
+    assert "Two Sum" in saved_entry["current_solution"]
+    assert saved_entry["raw_code"] == "class Solution: pass"
+
+
+def test_restoring_from_history_brings_back_full_state():
+    at = _fresh_app()
+
+    problem_a = "Example: Input: nums = [2,7,11,15], target = 9 -> Output: [0,1]"
+    problem_box = next(w for w in at.text_area if w.key == "_problem_widget")
+    problem_box.set_value(problem_a)
+    at.run()
+    at.session_state["problem_text"] = at.session_state["_problem_widget"]
+    at.session_state["current_solution"] = (
+        "<title>Two Sum</title><problem_statement>x</problem_statement><key_idea>x</key_idea>"
+        "<approach>x</approach><worked_example>x</worked_example><code>```python\nx\n```</code>"
+        "<explanation>x</explanation><complexity>x</complexity><takeaway>x</takeaway>"
+    )
+    at.session_state["raw_code"] = "class Solution: pass"
+    at.run()
+
+    # Switch away, wiping the active view.
+    problem_b = 'Example: Input: s = "()[]{}" -> Output: true'
+    problem_box = next(w for w in at.text_area if w.key == "_problem_widget")
+    problem_box.set_value(problem_b)
+    at.run()
+    at.session_state["problem_text"] = at.session_state["_problem_widget"]
+    at.session_state["current_solution"] = None
+    at.run()
+    assert at.session_state["current_solution"] is None
+
+    history = at.session_state["problem_history"]
+    restore_key = list(history.keys())[0]
+    restore_btn = next((b for b in at.button if b.key == f"restore_{restore_key}"), None)
+    assert restore_btn is not None, "restore button not found in sidebar"
+    restore_btn.click().run()
+    assert not at.exception
+
+    assert "Two Sum" in at.session_state["current_solution"]
+    assert at.session_state["problem_text"] == problem_a
+    assert at.session_state["raw_code"] == "class Solution: pass"
+    # The widget itself must also reflect the restored text (not just
+    # the internal problem_text variable), and this must not have raised
+    # a StreamlitAPIException -- see _restore_from_history()'s docstring
+    # on why it's safe to set here.
+    assert at.session_state["_problem_widget"] == problem_a
 
 
 def test_socratic_full_conversation_converges_to_hint_tabs(monkeypatch):
@@ -397,6 +480,8 @@ def test_first_run_key_textbox_actually_wires_up_the_key(monkeypatch):
     environment) and after (so we don't leak a "no keys" cache into
     other tests that expect the fake keys set at module import time).
     """
+    import dotenv
+    monkeypatch.setattr(dotenv, "load_dotenv", lambda *args, **kwargs: False)
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     st.cache_resource.clear()
@@ -443,6 +528,7 @@ def test_save_lesson_to_memory_builds_structured_record(tmp_path, monkeypatch):
         "<problem_statement>Two Sum</problem_statement>"
         "<key_idea>use a hash map</key_idea>"
         "<approach>iterate once</approach>"
+        "<worked_example>i=0: nums[0]=2, target-2=7, not seen, remember. i=1: nums[1]=7, target-7=2, seen at 0, return [0,1]</worked_example>"
         "<code>```python\nclass Solution:\n    def twoSum(self, nums, target):\n        return []\n```</code>"
         "<explanation>explained</explanation>"
         "<complexity>O(n)</complexity>"
@@ -485,7 +571,7 @@ def test_lessons_persist_across_sessions_for_same_client_id(tmp_path, monkeypatc
     at.session_state["problem_text"] = at.session_state["_problem_widget"]
     at.session_state["current_solution"] = (
         "<title>Two Sum</title>"
-        "<problem_statement>x</problem_statement><key_idea>x</key_idea><approach>x</approach>"
+        "<problem_statement>x</problem_statement><key_idea>x</key_idea><approach>x</approach><worked_example>x</worked_example>"
         "<code>```python\nx\n```</code><explanation>x</explanation><complexity>x</complexity>"
         "<takeaway>use a hash map</takeaway>"
     )
@@ -517,7 +603,7 @@ def test_forget_lessons_button_clears_persisted_data(tmp_path, monkeypatch):
     at.session_state["problem_text"] = at.session_state["_problem_widget"]
     at.session_state["current_solution"] = (
         "<title>Sample</title>"
-        "<problem_statement>x</problem_statement><key_idea>x</key_idea><approach>x</approach>"
+        "<problem_statement>x</problem_statement><key_idea>x</key_idea><approach>x</approach><worked_example>x</worked_example>"
         "<code>```python\nx\n```</code><explanation>x</explanation><complexity>x</complexity>"
         "<takeaway>t</takeaway>"
     )
@@ -556,7 +642,7 @@ def test_saved_lessons_are_capped_fifo(tmp_path, monkeypatch):
     for i in range(MAX_LESSONS_IN_MEMORY + 5):
         at.session_state["current_solution"] = (
             f"<title>Problem {i}</title>"
-            "<problem_statement>x</problem_statement><key_idea>x</key_idea><approach>x</approach>"
+            "<problem_statement>x</problem_statement><key_idea>x</key_idea><approach>x</approach><worked_example>x</worked_example>"
             "<code>```python\nx\n```</code><explanation>x</explanation><complexity>x</complexity>"
             f"<takeaway>takeaway {i}</takeaway>"
         )

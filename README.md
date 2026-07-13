@@ -42,6 +42,7 @@ Most AI tools just spit out the final code. You copy it, paste it, pass the test
 | **🛡️ Two-Layer Rate Limiting** | A per-session sliding-window nudge, plus a process-wide daily budget shared across every visitor, to keep the shared free-tier API keys from being drained by ordinary traffic growth. See caveats below. |
 | **⚡ Streaming Responses** | Solutions and standard hints stream in as they're generated instead of a silent multi-second spinner. |
 | **💾 Cross-Refresh Lesson Storage** | Saved lessons survive a tab refresh via a lightweight local SQLite store keyed to the page URL. See Limitations below for exact scope. |
+| **📜 Problem History** | Switching to a new problem, or re-clicking Hints/Solve/Fix, never silently discards what you already generated — every problem's latest solution/hints stay one click away in the sidebar. |
 
 ---
 

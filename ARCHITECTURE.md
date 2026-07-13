@@ -17,6 +17,7 @@ session.
 | `lesson_memory.py` | Topic-tags saved lessons via keyword matching; picks the most relevant ones for a given problem. | No. |
 | `rate_limiter.py` | `RateLimiter` (per-session sliding window) and `GlobalRateLimiter` (process-wide daily budget), both with non-mutating `would_allow()` peeks. | No — plain Python classes. |
 | `persistence.py` | Best-effort SQLite-backed lesson storage keyed by a URL-persisted client id, so saved lessons survive a tab refresh. | No — plain `sqlite3`, no Streamlit imports. |
+| `problem_history.py` | Snapshots each problem's generated solution/hints in-memory, keyed by (problem_text, language), so switching to a different problem (or re-clicking hints/solve/fix) never silently discards the previous one. | No. |
 | `app_helpers.py` | Glue: the consolidated rate-limit gate (`check_and_consume_rate_limits`), server-side length caps, error-message categorization, lesson-context assembly. | Yes, via `st.session_state`/`st.cache_resource`. |
 | `styles.py` | Static + theme-dependent CSS strings. | No — returns strings; `main.py` calls `st.markdown()` on them. |
 | `logger.py` | App-wide logger; console always, file best-effort (rotating, 1MB cap) — see Known Limitations. | No. |

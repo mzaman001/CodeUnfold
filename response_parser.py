@@ -50,7 +50,7 @@ def extract_sections(text: str, tags: list) -> dict:
 HINT_TAGS = ["intuition", "walkthrough", "pseudocode"]
 REVIEW_TAGS = ["critique", "logic_flaw", "fix_direction"]
 SOLUTION_TAGS = [
-    "problem_statement", "key_idea", "approach",
+    "problem_statement", "key_idea", "approach", "worked_example",
     "code", "explanation", "complexity", "takeaway",
 ]
 

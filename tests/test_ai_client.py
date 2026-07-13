@@ -81,9 +81,24 @@ def test_hint_prompt_includes_lessons_context():
     assert "watch for off-by-one" in prompt
 
 
+def test_hint_prompt_requires_depth_and_jargon_glossing():
+    """Regression test for real user feedback that hint responses were
+    too short/terse for a beginner to actually follow. The prompt must
+    explicitly forbid terseness and require every technical term to be
+    defined inline the first time it's used."""
+    prompt = build_pedagogical_hint_prompt("Two Sum problem", "Python")
+    assert "A terse response is a FAILURE" in prompt
+    assert "Define every technical term" in prompt
+
+
+def test_hint_prompt_walkthrough_requires_problems_own_example():
+    prompt = build_pedagogical_hint_prompt("Two Sum problem", "Python")
+    assert "the problem's OWN example" in prompt or "problem's own example" in prompt.lower()
+
+
 def test_solve_prompt_contains_required_tags():
     prompt = build_solve_prompt("Two Sum problem text", "Python", "")
-    for tag in ("problem_statement", "key_idea", "approach", "code",
+    for tag in ("problem_statement", "key_idea", "approach", "worked_example", "code",
                 "explanation", "complexity", "takeaway", "user_problem"):
         assert f"<{tag}>" in prompt
 
@@ -92,6 +107,32 @@ def test_solve_prompt_embeds_language():
     prompt = build_solve_prompt("problem", "JavaScript", "")
     assert "JavaScript" in prompt
     assert "```javascript" in prompt
+
+
+def test_solve_prompt_requires_worked_example_with_concrete_grounding():
+    """The solve prompt previously had no dedicated worked-example section
+    at all -- the single most evidence-backed technique for reducing
+    cognitive load for novices (Sweller's worked-example effect) was
+    entirely missing from the main solution explanation. Confirm the
+    section exists and explicitly requires using the problem's own
+    example values, not a generic placeholder."""
+    prompt = build_solve_prompt("problem", "Python", "")
+    assert "<worked_example>" in prompt
+    assert "EXACT example from the problem" in prompt
+
+
+def test_solve_prompt_has_no_word_cap():
+    """Regression test: a fixed word-count ceiling ("under 1800 words")
+    reliably produced terse, under-explained responses -- directly the
+    opposite of what a beginner needs. Confirm it's gone."""
+    prompt = build_solve_prompt("problem", "Python", "")
+    assert "1800 words" not in prompt
+    assert "NO length limit" in prompt
+
+
+def test_solve_prompt_requires_jargon_glossing():
+    prompt = build_solve_prompt("problem", "Python", "")
+    assert "Explain EVERY technical term" in prompt
 
 
 def test_solve_prompt_embeds_lessons_context():
@@ -175,12 +216,34 @@ def test_socratic_question_prompt_includes_lessons_context():
     assert "watch for off-by-one" in prompt
 
 
+def test_socratic_question_prompt_requires_concrete_grounding():
+    """Regression test for real user feedback: Socratic questions were
+    confusing to beginners because the prompt only loosely asked the
+    model to "probe understanding", which readily produces abstract,
+    jargon-laden questions unanswerable without already knowing the
+    destination concept. The prompt must now explicitly require the
+    question be answerable by reasoning about the problem's own concrete
+    example, and explicitly warn against assuming CS vocabulary.
+    """
+    prompt = build_socratic_question_prompt("Two Sum problem", "Python")
+    assert "CONCRETE example" in prompt
+    assert "not by already knowing algorithms or Big-O vocabulary" in prompt
+    # The good/bad contrastive example should be present to anchor style.
+    assert "GOOD" in prompt and "BAD" in prompt
+
+
 def test_socratic_feedback_prompt_non_final_asks_next_question():
     convo = [{"question": "Why might brute force be slow here?", "answer": "It's O(n^2)"}]
     prompt = build_socratic_feedback_prompt("problem", "Python", convo, is_final_turn=False)
     assert "<next_question>" in prompt
     assert "<intuition>" not in prompt
     assert "It's O(n^2)" in prompt
+
+
+def test_socratic_feedback_prompt_next_question_requires_concrete_grounding():
+    convo = [{"question": "Q1", "answer": "A1"}]
+    prompt = build_socratic_feedback_prompt("problem", "Python", convo, is_final_turn=False)
+    assert "concretely about the problem's own example" in prompt
 
 
 def test_socratic_feedback_prompt_final_turn_converges_to_hint_tags():

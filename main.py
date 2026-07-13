@@ -22,6 +22,7 @@ from response_parser import (
 from code_verifier import verify_solution
 from lesson_memory import build_lesson
 import persistence
+import problem_history
 from app_helpers import (
     MAX_PROBLEM_CHARS, MAX_CODE_CHARS, MAX_LESSONS_IN_MEMORY, MAX_ATTEMPT_ERRORS,
     _enforce_server_side_length, _get_user_code_capped,
@@ -84,6 +85,7 @@ _defaults = {
     "socratic_pending_question": None,
     "socratic_done": False,
     "privacy_notice_shown": False,
+    "problem_history": {},
 }
 for key, default in _defaults.items():
     if key not in st.session_state:
@@ -112,6 +114,69 @@ if "ai_limiter" not in st.session_state:
         st.session_state.lessons_memory = persistence.load_lessons_from_db(db_path, client_id)
     else:
         st.session_state.lessons_memory = []
+
+def _snapshot_current_problem():
+    """Saves the current problem's full state into history, if there's
+    anything worth saving (a solution or hints were actually generated).
+
+    Called once, unconditionally, near the top of every script run --
+    deliberately BEFORE any of this run's button-handling logic can
+    change problem_text/current_solution/etc. That means it always
+    captures "whatever was true at the end of the previous run", which
+    is exactly the state that needs preserving right before this run
+    might switch to a different problem, overwrite the solution via a
+    fix-loop call, or otherwise change things. This is what lets a user
+    paste a new problem (or click Fix, or re-request hints) without
+    losing the previous problem's generated solution/hints -- it was
+    already snapshotted into history before this run's changes happened.
+    """
+    solution = st.session_state.get("current_solution")
+    hints = st.session_state.get("current_hints")
+    if not problem_history.has_content(solution, hints):
+        return
+    text = st.session_state.get("problem_text", "")
+    if not text:
+        return
+    language = st.session_state.get("language", "Python")
+    key = problem_history.history_key(text, language)
+    title = extract_tag(solution or "", "title") or (text.split("\n")[0][:50] if text else "Untitled")
+    st.session_state.problem_history[key] = problem_history.build_snapshot(
+        problem_text=text, language=language,
+        current_solution=solution, current_hints=hints,
+        raw_code=st.session_state.get("raw_code", ""),
+        verification=st.session_state.get("verification"),
+        attempt_errors=st.session_state.get("attempt_errors", []),
+        title=title,
+    )
+    st.session_state.problem_history = problem_history.cap_history(st.session_state.problem_history)
+
+
+def _restore_from_history(key: str):
+    """Restores a previously-snapshotted problem as the active one.
+
+    Safe to set widget-owned keys (`_problem_widget`, `language`)
+    directly here because this is called from the sidebar, which renders
+    earlier in the script than the language selectbox and the problem
+    text area -- see AGENTS.md's hard rule on session_state/widget-key
+    ordering for why this matters and what goes wrong if violated.
+    """
+    snap = st.session_state.problem_history.get(key)
+    if not snap:
+        return
+    st.session_state.problem_text = snap["problem_text"]
+    st.session_state["_problem_widget"] = snap["problem_text"]
+    st.session_state.language = snap["language"]
+    st.session_state.current_solution = snap["current_solution"]
+    st.session_state.current_hints = snap["current_hints"]
+    st.session_state.raw_code = snap["raw_code"]
+    st.session_state.verification = snap["verification"]
+    st.session_state.attempt_errors = list(snap["attempt_errors"])
+    st.session_state.socratic_conversation = []
+    st.session_state.socratic_pending_question = None
+    st.session_state.socratic_done = False
+    st.session_state.lesson_saved = False
+    st.session_state.show_update_alert = False
+
 
 def _reset_problem_state():
     """Clears everything derived from the current problem/language/code.
@@ -225,6 +290,11 @@ def _trigger_fix_loop(prob_text: str, errors: list, user_key: str = None):
             st.error(f"An error occurred: {e}")
 
 
+# Snapshot the current problem into history before anything in this run
+# can change it -- see _snapshot_current_problem()'s docstring for why
+# this needs to happen here, this early, unconditionally.
+_snapshot_current_problem()
+
 # ---------- Sidebar ----------
 with st.sidebar:
     st.markdown("## 🤖 CodeUnfold")
@@ -294,6 +364,25 @@ with st.sidebar:
                 st.rerun()
         else:
             st.caption("No lessons yet.")
+
+    with st.expander("📜 Problem History", expanded=False):
+        st.caption("Switch back to a problem you've already generated a solution or hints for, without losing it or re-calling the AI.")
+        recent = problem_history.recent_entries(st.session_state.get("problem_history", {}), limit=8)
+        current_key = problem_history.history_key(
+            st.session_state.get("problem_text", ""), st.session_state.get("language", "Python")
+        )
+        if recent:
+            for key, entry in recent:
+                is_current = key == current_key
+                label = f"{'📍 ' if is_current else ''}`{entry['language']}` {entry['title']}"
+                cols = st.columns([4, 1])
+                cols[0].caption(label)
+                if not is_current:
+                    if cols[1].button("↩️", key=f"restore_{key}", help="Restore this problem"):
+                        _restore_from_history(key)
+                        st.rerun()
+        else:
+            st.caption("Nothing here yet -- generate a solution or hints for a problem to start building history.")
 
 # ---------- Dynamic CSS Injection ----------
 bg_color = "#000000" if st.session_state.get("theme") == "AMOLED" else "#0f172a"
@@ -660,6 +749,7 @@ if st.session_state.current_solution:
                 st.markdown(sections["key_idea"])
             with s_tab2:
                 st.markdown(sections["approach"])
+                st.markdown(sections["worked_example"])
                 st.markdown(sections["complexity"])
             with s_tab3:
                 verification = st.session_state.get("verification")

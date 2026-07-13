@@ -23,7 +23,7 @@ pip install -r requirements.txt -r requirements-dev.txt
 
 ```bash
 python3 -m py_compile main.py ai_client.py rate_limiter.py response_parser.py \
-    code_verifier.py logger.py app_helpers.py styles.py lesson_memory.py persistence.py
+    code_verifier.py logger.py app_helpers.py styles.py lesson_memory.py persistence.py problem_history.py
 ruff check .
 pytest -v
 ```
@@ -103,6 +103,21 @@ GROQ_API_KEY=fake GEMINI_API_KEY=fake timeout 8 streamlit run main.py \
   per-session cap entirely. If you add a new AI-call site, call this
   function first and bail out on `allowed=False` — don't write a new
   check sequence.
+- **Prompt changes must not regress the pedagogy standard.** The
+  teaching prompts in `ai_client.py` (`build_solve_prompt`,
+  `build_pedagogical_hint_prompt`, `build_socratic_question_prompt`,
+  `build_socratic_feedback_prompt`, `build_code_review_prompt`) were
+  rewritten based on real user feedback that responses were too terse
+  and Socratic questions were confusingly abstract for beginners. Every
+  one of them now requires: (1) every technical term defined inline the
+  first time it's used, (2) a concrete worked example using the
+  problem's own numbers, not a generic placeholder, (3) Socratic
+  questions answerable by reasoning about the concrete example, never
+  by already knowing CS/Big-O vocabulary, and (4) no arbitrary word
+  caps (a length ceiling reliably produces under-explained output).
+  These are enforced by tests in `test_ai_client.py` — if you edit a
+  prompt, keep those tests passing and add new ones for whatever you
+  changed, don't loosen them to make an edit fit.
 
 ## Style
 

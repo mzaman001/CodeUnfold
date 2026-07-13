@@ -61,7 +61,7 @@ def test_extract_review_sections_all_present():
 
 
 def test_extract_solution_sections_all_present():
-    tags = ["problem_statement", "key_idea", "approach", "code", "explanation", "complexity", "takeaway"]
+    tags = ["problem_statement", "key_idea", "approach", "worked_example", "code", "explanation", "complexity", "takeaway"]
     text = "".join(f"<{t}>{t}_value</{t}>" for t in tags)
     result = extract_solution_sections(text)
     assert all(result[t] == f"{t}_value" for t in tags)
