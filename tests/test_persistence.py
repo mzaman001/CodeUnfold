@@ -1,5 +1,6 @@
 import sys
 import os
+import sqlite3
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -7,6 +8,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from persistence import (
     init_db, save_lesson_to_db, load_lessons_from_db,
     delete_client_lessons, delete_last_lesson, new_client_id, get_db_path, DB_ENV_VAR,
+    save_problem_history, load_problem_history, delete_client_history,
+    save_socratic_conversation, load_socratic_conversations, delete_client_socratic,
 )
 
 
@@ -20,6 +23,28 @@ def test_init_db_creates_table(tmp_path):
     db_path = str(tmp_path / "test.db")
     assert init_db(db_path) is True
     assert os.path.exists(db_path)
+
+
+def test_init_db_creates_problem_history_and_socratic_tables(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    assert init_db(db_path) is True
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    names = {row[0] for row in rows}
+    assert "lessons" in names
+    assert "problem_history" in names
+    assert "socratic_conversations" in names
+
+
+def test_init_db_is_idempotent_across_new_tables(tmp_path):
+    """Re-running init_db on an existing database (the normal app boot
+    path, which happens once per session) must not error out or duplicate
+    anything -- the CREATE TABLE IF NOT EXISTS guards make it a no-op."""
+    db_path = str(tmp_path / "test.db")
+    assert init_db(db_path) is True
+    assert init_db(db_path) is True
 
 
 def test_init_db_fails_gracefully_on_bad_path():
@@ -130,6 +155,221 @@ def test_delete_last_lesson_on_empty_client_does_not_raise(tmp_path):
     db_path = str(tmp_path / "test.db")
     init_db(db_path)
     assert delete_last_lesson(db_path, "never-seen-client") is True
+
+
+def _snapshot(**overrides):
+    """Builds a snapshot in the exact shape problem_history.build_snapshot()
+    produces, so the roundtrip tests exercise the real record structure."""
+    snap = {
+        "problem_text": "Example: Input: nums = [2,7,11,15], target = 9 -> Output: [0,1]",
+        "language": "Python",
+        "current_solution": "<title>Two Sum</title><takeaway>use a hash map</takeaway>",
+        "current_hints": None,
+        "raw_code": "class Solution:\n    def twoSum(self, nums, target):\n        return []\n",
+        "verification": {"verified": True, "passed": True, "results": [], "reason": ""},
+        "attempt_errors": ["IndexError: list index out of range"],
+        "title": "Two Sum",
+        "timestamp": 1234.5,
+    }
+    snap.update(overrides)
+    return snap
+
+
+def test_save_and_load_problem_history_roundtrip(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    init_db(db_path)
+    client_id = new_client_id()
+    snapshot = _snapshot()
+
+    assert save_problem_history(db_path, client_id, "key1", snapshot) is True
+    loaded = load_problem_history(db_path, client_id)
+
+    assert set(loaded.keys()) == {"key1"}
+    assert loaded["key1"] == snapshot
+
+
+def test_save_problem_history_preserves_none_verification(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    init_db(db_path)
+    client_id = new_client_id()
+
+    save_problem_history(db_path, client_id, "key1", _snapshot(verification=None))
+    loaded = load_problem_history(db_path, client_id)
+
+    assert loaded["key1"]["verification"] is None
+
+
+def test_save_problem_history_upserts_same_key(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    init_db(db_path)
+    client_id = new_client_id()
+
+    save_problem_history(db_path, client_id, "key1", _snapshot(title="First version"))
+    save_problem_history(db_path, client_id, "key1", _snapshot(title="Second version"))
+    loaded = load_problem_history(db_path, client_id)
+
+    # One row per problem, holding the latest state -- mirrors the
+    # in-memory history dict's overwrite-in-place behavior.
+    assert len(loaded) == 1
+    assert loaded["key1"]["title"] == "Second version"
+
+
+def test_load_problem_history_isolated_by_client_id(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    init_db(db_path)
+    client_a, client_b = new_client_id(), new_client_id()
+
+    save_problem_history(db_path, client_a, "keyA", _snapshot(title="A"))
+    save_problem_history(db_path, client_b, "keyB", _snapshot(title="B"))
+
+    assert list(load_problem_history(db_path, client_a).keys()) == ["keyA"]
+    assert list(load_problem_history(db_path, client_b).keys()) == ["keyB"]
+
+
+def test_load_problem_history_missing_db_returns_empty(tmp_path):
+    db_path = str(tmp_path / "does_not_exist.db")
+    assert load_problem_history(db_path, "someone") == {}
+
+
+def test_load_problem_history_skips_corrupt_json_row(tmp_path):
+    """A row with corrupt JSON (e.g. a partially-written write) must be
+    skipped, not crash the whole load -- the good rows still come back."""
+    db_path = str(tmp_path / "test.db")
+    init_db(db_path)
+    client_id = new_client_id()
+
+    save_problem_history(db_path, client_id, "good", _snapshot(title="Good"))
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO problem_history (client_id, problem_key, problem_text, language, "
+            "title, current_solution, current_hints, raw_code, verification, attempt_errors, timestamp) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (client_id, "corrupt", "text", "Python", "Corrupt", None, None, "",
+             "{not json", "[]", 9999.0),
+        )
+        conn.commit()
+
+    loaded = load_problem_history(db_path, client_id)
+    assert list(loaded.keys()) == ["good"]
+
+
+def test_save_problem_history_missing_required_key_fails_gracefully(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    init_db(db_path)
+    # Missing "problem_text" -- should return False, not raise.
+    assert save_problem_history(db_path, new_client_id(), "key1", {"title": "no text"}) is False
+
+
+def test_delete_client_history_clears_only_that_client(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    init_db(db_path)
+    client_a, client_b = new_client_id(), new_client_id()
+
+    save_problem_history(db_path, client_a, "keyA", _snapshot(title="A"))
+    save_problem_history(db_path, client_b, "keyB", _snapshot(title="B"))
+
+    assert delete_client_history(db_path, client_a) is True
+    assert load_problem_history(db_path, client_a) == {}
+    assert list(load_problem_history(db_path, client_b).keys()) == ["keyB"]
+
+
+def _conversation(**overrides):
+    conv = {
+        "conversation": [
+            {"question": "What would you do by hand?", "answer": "check every pair"},
+        ],
+        "pending_question": "How would you avoid checking pairs twice?",
+        "problem_text": "Example: Input: nums = [2,7,11,15], target = 9 -> Output: [0,1]",
+        "language": "Python",
+    }
+    conv.update(overrides)
+    return conv
+
+
+def test_save_and_load_socratic_conversation_roundtrip(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    init_db(db_path)
+    client_id = new_client_id()
+
+    data = _conversation()
+    assert save_socratic_conversation(
+        db_path, client_id, "key1",
+        data["problem_text"], data["language"], data["conversation"], data["pending_question"],
+    ) is True
+
+    loaded = load_socratic_conversations(db_path, client_id)
+    assert set(loaded.keys()) == {"key1"}
+    assert loaded["key1"]["conversation"] == data["conversation"]
+    assert loaded["key1"]["pending_question"] == data["pending_question"]
+    assert loaded["key1"]["problem_text"] == data["problem_text"]
+
+
+def test_save_socratic_conversation_upserts_same_key(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    init_db(db_path)
+    client_id = new_client_id()
+
+    first = _conversation(pending_question="Round 1 question")
+    second = _conversation(pending_question="Round 2 question")
+    save_socratic_conversation(
+        db_path, client_id, "key1", first["problem_text"], first["language"],
+        first["conversation"], first["pending_question"],
+    )
+    save_socratic_conversation(
+        db_path, client_id, "key1", second["problem_text"], second["language"],
+        second["conversation"], second["pending_question"],
+    )
+
+    loaded = load_socratic_conversations(db_path, client_id)
+    assert len(loaded) == 1
+    assert loaded["key1"]["pending_question"] == "Round 2 question"
+
+
+def test_load_socratic_conversations_isolated_by_client_id(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    init_db(db_path)
+    client_a, client_b = new_client_id(), new_client_id()
+
+    a = _conversation()
+    b = _conversation(problem_text="Different problem")
+    save_socratic_conversation(
+        db_path, client_a, "keyA", a["problem_text"], a["language"], a["conversation"], a["pending_question"],
+    )
+    save_socratic_conversation(
+        db_path, client_b, "keyB", b["problem_text"], b["language"], b["conversation"], b["pending_question"],
+    )
+
+    assert list(load_socratic_conversations(db_path, client_a).keys()) == ["keyA"]
+    assert list(load_socratic_conversations(db_path, client_b).keys()) == ["keyB"]
+
+
+def test_load_socratic_conversations_missing_db_returns_empty(tmp_path):
+    assert load_socratic_conversations(str(tmp_path / "does_not_exist.db"), "someone") == {}
+
+
+def test_save_socratic_conversation_missing_required_key_fails_gracefully(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    init_db(db_path)
+    assert save_socratic_conversation(db_path, new_client_id(), "key1", "", "Python", [], "Q?") is True
+
+
+def test_delete_client_socratic_clears_only_that_client(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    init_db(db_path)
+    client_a, client_b = new_client_id(), new_client_id()
+
+    a = _conversation()
+    b = _conversation(problem_text="Different problem")
+    save_socratic_conversation(
+        db_path, client_a, "keyA", a["problem_text"], a["language"], a["conversation"], a["pending_question"],
+    )
+    save_socratic_conversation(
+        db_path, client_b, "keyB", b["problem_text"], b["language"], b["conversation"], b["pending_question"],
+    )
+
+    assert delete_client_socratic(db_path, client_a) is True
+    assert load_socratic_conversations(db_path, client_a) == {}
+    assert list(load_socratic_conversations(db_path, client_b).keys()) == ["keyB"]
 
 
 def test_save_lesson_missing_required_key_fails_gracefully(tmp_path):

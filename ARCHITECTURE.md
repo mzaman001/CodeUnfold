@@ -16,8 +16,9 @@ session.
 | `code_verifier.py` | Extracts examples from problem text, executes Python/JS solutions against them in a subprocess. | No. |
 | `lesson_memory.py` | Topic-tags saved lessons via keyword matching; picks the most relevant ones for a given problem. | No. |
 | `rate_limiter.py` | `RateLimiter` (per-session sliding window) and `GlobalRateLimiter` (process-wide daily budget), both with non-mutating `would_allow()` peeks. | No — plain Python classes. |
-| `persistence.py` | Best-effort SQLite-backed lesson storage keyed by a URL-persisted client id, so saved lessons survive a tab refresh. | No — plain `sqlite3`, no Streamlit imports. |
-| `problem_history.py` | Snapshots each problem's generated solution/hints in-memory, keyed by (problem_text, language), so switching to a different problem (or re-clicking hints/solve/fix) never silently discards the previous one. | No. |
+| `persistence.py` | Best-effort SQLite-backed storage for saved lessons, problem history, and in-progress Socratic exchanges, keyed by a URL-persisted client id, so all of them survive a tab refresh. | No — plain `sqlite3`, no Streamlit imports. |
+| `problem_history.py` | Snapshots each problem's generated solution/hints in-memory, keyed by (problem_text, language), so switching to a different problem (or re-clicking hints/solve/fix) never silently discards the previous one. The same snapshots are mirrored to `persistence.py` and rehydrated on boot, so history also survives a refresh. | No. |
+| `progress_stats.py` | Pure-logic aggregation of problem history into the sidebar Progress dashboard's numbers (solved, fix loops, language/topic breakdown), using `lesson_memory.infer_tags` for topics. | No. |
 | `app_helpers.py` | Glue: the consolidated rate-limit gate (`check_and_consume_rate_limits`), server-side length caps, error-message categorization, lesson-context assembly. | Yes, via `st.session_state`/`st.cache_resource`. |
 | `styles.py` | Static + theme-dependent CSS strings. | No — returns strings; `main.py` calls `st.markdown()` on them. |
 | `logger.py` | App-wide logger; console always, file best-effort (rotating, 1MB cap) — see Known Limitations. | No. |
@@ -54,6 +55,14 @@ that would risk subtle session-state bugs for a marginal readability win.
 7. `code_verifier.verify_solution()` actually runs the extracted Python/JS code against an example parsed from the problem text, in a timeout-bounded subprocess — this is what backs the ✅/❌ badge, replacing the model's own self-reported "I traced 2 edge cases" claim.
 8. The tabbed UI renders; the student can save a takeaway to `lessons_memory` (tagged via `lesson_memory.build_lesson`) for future prompts to reference.
 
+At the top of every rerun, `_snapshot_current_problem()` mirrors the
+current solution/hints state into `problem_history` and — best-effort —
+into `persistence.py`, and `_persist_socratic_state()` mirrors any
+in-progress Socratic exchange. On session boot the bootstrap block
+rehydrates both, so a tab refresh restores the sidebar restore list, the
+Progress dashboard's all-time stats, and a mid-conversation Socratic
+flow.
+
 ## Data flow: Socratic hint mode
 
 Instead of steps 4–6 above producing the full hint breakdown in one call,
@@ -64,6 +73,18 @@ next prompt), and after `SOCRATIC_MAX_TURNS` rounds converges into the
 same `<intuition>/<walkthrough>/<pseudocode>` tag set the standard hint
 prompt produces — so the display code doesn't need a separate renderer,
 just the same `response_parser.extract_hint_sections()` it already had.
+While a question is pending, the exchange is mirrored to
+`persistence.py` and restored on the next boot (see the note above).
+
+## Data flow: Recall Review
+
+The sidebar's Recall Review flow (`main.py`'s `_start_review` +
+`build_review_question_prompt` / `build_review_feedback_prompt`) runs
+retrieval practice on a saved lesson or a past problem's `<takeaway>`:
+one recall-check question, then specific feedback on the student's
+answer. It's an ordinary AI-call site — it goes through
+`check_and_consume_rate_limits()` and sanitizes both the injected
+takeaway and the student's answer.
 
 ## Known limitations
 
@@ -71,10 +92,11 @@ just the same `response_parser.extract_hint_sections()` it already had.
   running process. Scaling to multiple instances behind a load balancer
   would give each instance its own independent budget.
 - **Persistence is best-effort and URL-scoped, not a real account
-  system.** `lessons_memory` is hydrated from a local SQLite file
-  (`persistence.py`) keyed by a random client id kept in the page's URL
-  query params. That survives a tab refresh (same URL) but not a fresh
-  tab/browser without that URL, doesn't sync across devices, and (like
+  system.** `lessons_memory`, problem history, and in-progress Socratic
+  exchanges are hydrated from a local SQLite file (`persistence.py`)
+  keyed by a random client id kept in the page's URL query params. That
+  survives a tab refresh (same URL) but not a fresh tab/browser without
+  that URL, doesn't sync across devices, and (like
   `GlobalRateLimiter`) only covers a single instance/filesystem -- a
   redeploy that wipes the filesystem, or scaling to multiple instances,
   breaks it. See `persistence.py`'s module docstring and `SECURITY.md`

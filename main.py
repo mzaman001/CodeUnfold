@@ -10,6 +10,7 @@ from ai_client import (
     build_fix_prompt,
     build_pedagogical_hint_prompt, build_code_review_prompt,
     build_socratic_question_prompt, build_socratic_feedback_prompt,
+    build_review_question_prompt, build_review_feedback_prompt,
     SOCRATIC_MAX_TURNS,
     get_clients
 )
@@ -23,6 +24,7 @@ from code_verifier import verify_solution
 from lesson_memory import build_lesson
 import persistence
 import problem_history
+import progress_stats
 from app_helpers import (
     MAX_PROBLEM_CHARS, MAX_CODE_CHARS, MAX_LESSONS_IN_MEMORY, MAX_ATTEMPT_ERRORS,
     _enforce_server_side_length, _get_user_code_capped,
@@ -86,6 +88,9 @@ _defaults = {
     "socratic_done": False,
     "privacy_notice_shown": False,
     "problem_history": {},
+    "review_source": None,
+    "review_question": None,
+    "review_feedback": None,
 }
 for key, default in _defaults.items():
     if key not in st.session_state:
@@ -112,6 +117,34 @@ if "ai_limiter" not in st.session_state:
     st.session_state.persistence_available = persistence.init_db(db_path)
     if st.session_state.persistence_available:
         st.session_state.lessons_memory = persistence.load_lessons_from_db(db_path, client_id)
+        # Hydrate durable problem history back into the session's capped
+        # in-memory dict, so a tab refresh (same URL cid) restores the
+        # sidebar restore list exactly as if the session never ended.
+        # cap_history keeps the in-memory working set at the same
+        # 15-entry bound as before; the DB remains the all-time source
+        # for the progress dashboard.
+        st.session_state.problem_history = problem_history.cap_history(
+            persistence.load_problem_history(db_path, client_id)
+        )
+        # Resume an in-progress Socratic exchange if one was left mid-flow
+        # by a previous session with this client id. A genuine refresh
+        # loses the problem text itself, so keying the restore on the
+        # current problem can't work -- instead the most recent stored
+        # exchange with a pending question is restored wholesale (problem
+        # text, language, conversation, question), recreating exactly the
+        # state that was showing when the refresh happened. Setting
+        # `_problem_widget` here is safe: the widget doesn't exist yet at
+        # bootstrap (same rationale as _restore_from_history()).
+        conversations = persistence.load_socratic_conversations(db_path, client_id)
+        in_progress = {k: v for k, v in conversations.items() if v.get("pending_question")}
+        if in_progress:
+            latest = max(in_progress.values(), key=lambda v: v.get("timestamp", 0))
+            st.session_state.socratic_conversation = latest["conversation"]
+            st.session_state.socratic_pending_question = latest["pending_question"]
+            st.session_state.socratic_done = False
+            st.session_state.problem_text = latest["problem_text"]
+            st.session_state["_problem_widget"] = latest["problem_text"]
+            st.session_state.language = latest["language"]
     else:
         st.session_state.lessons_memory = []
 
@@ -140,7 +173,7 @@ def _snapshot_current_problem():
     language = st.session_state.get("language", "Python")
     key = problem_history.history_key(text, language)
     title = extract_tag(solution or "", "title") or (text.split("\n")[0][:50] if text else "Untitled")
-    st.session_state.problem_history[key] = problem_history.build_snapshot(
+    snapshot = problem_history.build_snapshot(
         problem_text=text, language=language,
         current_solution=solution, current_hints=hints,
         raw_code=st.session_state.get("raw_code", ""),
@@ -148,7 +181,18 @@ def _snapshot_current_problem():
         attempt_errors=st.session_state.get("attempt_errors", []),
         title=title,
     )
+    st.session_state.problem_history[key] = snapshot
     st.session_state.problem_history = problem_history.cap_history(st.session_state.problem_history)
+
+    # Best-effort mirror to durable storage (see persistence.py for the
+    # single-instance/file-based scope). The upsert is idempotent and the
+    # function swallows its own errors, so a read-only filesystem can
+    # never crash the snapshot path -- history simply falls back to
+    # in-memory-only, the pre-durability behavior.
+    if st.session_state.get("persistence_available"):
+        persistence.save_problem_history(
+            persistence.get_db_path(), st.session_state.client_id, key, snapshot
+        )
 
 
 def _restore_from_history(key: str):
@@ -193,6 +237,64 @@ def _reset_problem_state():
     st.session_state.socratic_conversation = []
     st.session_state.socratic_pending_question = None
     st.session_state.socratic_done = False
+
+def _persist_socratic_state():
+    """Best-effort durable mirror of an in-progress Socratic exchange.
+
+    Runs alongside _snapshot_current_problem() on every rerun (same
+    timing rationale: capture state before this run's handlers can
+    change it). Only persists while a question is actually pending -- a
+    converged exchange lives on in problem_history via current_hints, so
+    it doesn't need a row here. The bootstrap restore side picks the
+    most recent row with a pending question, which is exactly the state
+    worth resuming after a refresh. Failure-safe: save_socratic_conversation
+    swallows its own errors, so a read-only filesystem can't crash this.
+    """
+    if not st.session_state.get("persistence_available"):
+        return
+    pending = st.session_state.get("socratic_pending_question")
+    if pending is None:
+        return
+    text = st.session_state.get("problem_text", "")
+    if not text:
+        return
+    language = st.session_state.get("language", "Python")
+    key = problem_history.history_key(text, language)
+    persistence.save_socratic_conversation(
+        persistence.get_db_path(), st.session_state.client_id, key,
+        text, language, st.session_state.get("socratic_conversation", []), pending,
+    )
+
+
+def _start_review(review_source: dict, user_key: str = None):
+    """Kicks off the Recall Review flow for the given source -- a saved
+    lesson's {"title", "content", "language"} or the same shape derived
+    from a past problem. Generates one recall-check question and stashes
+    it in session state for the sidebar expander to render; the answer
+    submission path lives in that expander.
+
+    Goes through the consolidated rate-limit gate like every other
+    AI-call site (see app_helpers.check_and_consume_rate_limits); on
+    failure it leaves the review state untouched so the user can retry.
+    """
+    allowed, limit_msg = check_and_consume_rate_limits(user_key)
+    if not allowed:
+        st.error(limit_msg)
+        return
+    try:
+        with st.spinner("Thinking of a recall question..."):
+            q_result = _call_ai(build_review_question_prompt(review_source), user_key)
+        question = extract_tag(q_result, "question")
+        if not question:
+            st.error("The tutor didn't produce a question. Please try again.")
+            return
+        st.session_state.review_source = review_source
+        st.session_state.review_question = question
+        st.session_state.review_feedback = None
+        st.rerun()
+    except Exception as e:
+        _show_error(e, "review question generation")
+
 
 def _sync_language():
     _reset_problem_state()
@@ -294,6 +396,9 @@ def _trigger_fix_loop(prob_text: str, errors: list, user_key: str = None):
 # can change it -- see _snapshot_current_problem()'s docstring for why
 # this needs to happen here, this early, unconditionally.
 _snapshot_current_problem()
+# Same timing rationale: mirror any in-progress Socratic exchange to
+# durable storage before this run's handlers can change it.
+_persist_socratic_state()
 
 # ---------- Sidebar ----------
 with st.sidebar:
@@ -365,6 +470,68 @@ with st.sidebar:
         else:
             st.caption("No lessons yet.")
 
+    with st.expander("🧠 Recall Review", expanded=False):
+        st.caption("Retrieval practice: quiz yourself on a saved lesson's key idea, then check your answer.")
+        if st.session_state.get("review_question"):
+            # A question is pending: show it and collect the answer. The
+            # three branches below are mutually exclusive (only one
+            # renders per run), so the selectbox / answer box / done
+            # button never collide on widget keys.
+            st.markdown(f"**Reviewing:** {st.session_state.review_source['title']}")
+            st.markdown(f"**Q:** {st.session_state.review_question}")
+            review_answer = st.text_area("Your answer:", key="review_answer_box", height=80)
+            if st.button("✅ Submit answer", use_container_width=True, key="review_submit_btn"):
+                if not review_answer.strip():
+                    st.warning("Type an answer first (even a guess is fine!).")
+                else:
+                    allowed, limit_msg = check_and_consume_rate_limits(user_gemini_key)
+                    if not allowed:
+                        st.error(limit_msg)
+                    else:
+                        try:
+                            with st.spinner("Checking your answer..."):
+                                fb_result = _call_ai(
+                                    build_review_feedback_prompt(
+                                        st.session_state.review_source,
+                                        st.session_state.review_question,
+                                        _enforce_server_side_length(review_answer.strip(), MAX_CODE_CHARS),
+                                    ),
+                                    user_gemini_key,
+                                )
+                            st.session_state.review_feedback = fb_result
+                            st.rerun()
+                        except Exception as e:
+                            _show_error(e, "review feedback")
+        elif st.session_state.get("review_feedback"):
+            # Feedback is in: reveal the takeaway, offer to move on.
+            st.markdown(f"**Reviewing:** {st.session_state.review_source['title']}")
+            st.success(st.session_state.review_feedback)
+            takeaway = st.session_state.review_source.get("content", "")
+            if takeaway:
+                st.caption(f"📝 The takeaway: {takeaway}")
+            if st.button("🎉 Done — back to lessons", use_container_width=True, key="review_done_btn"):
+                st.session_state.review_source = None
+                st.session_state.review_question = None
+                st.session_state.review_feedback = None
+                st.rerun()
+        else:
+            saved_lessons = st.session_state.get("lessons_memory", [])
+            if not saved_lessons:
+                st.caption("No lessons saved yet. Generate a solution and hit 'Save this approach to memory' first.")
+            else:
+                labels = [f"{lesson['title']} ({lesson['language']})" for lesson in saved_lessons]
+                choice = st.selectbox("Lesson to recall-check", labels, key="review_source_select")
+                if st.button("🧠 Generate review question", use_container_width=True, key="review_quiz_btn"):
+                    lesson = saved_lessons[labels.index(choice)]
+                    _start_review(
+                        {
+                            "title": lesson.get("title", "Untitled"),
+                            "content": lesson.get("takeaway", ""),
+                            "language": lesson.get("language", "Python"),
+                        },
+                        user_gemini_key,
+                    )
+
     with st.expander("📜 Problem History", expanded=False):
         st.caption("Switch back to a problem you've already generated a solution or hints for, without losing it or re-calling the AI.")
         recent = problem_history.recent_entries(st.session_state.get("problem_history", {}), limit=8)
@@ -375,14 +542,71 @@ with st.sidebar:
             for key, entry in recent:
                 is_current = key == current_key
                 label = f"{'📍 ' if is_current else ''}`{entry['language']}` {entry['title']}"
-                cols = st.columns([4, 1])
+                cols = st.columns([3, 1, 1])
                 cols[0].caption(label)
                 if not is_current:
                     if cols[1].button("↩️", key=f"restore_{key}", help="Restore this problem"):
                         _restore_from_history(key)
                         st.rerun()
+                # Recall-check on a past problem: same review flow as saved
+                # lessons, with the problem's stored <takeaway> as content.
+                # Skipped (with a warning) when the entry has no takeaway
+                # saved, so we never burn an AI call on empty data.
+                if cols[2].button("🧠", key=f"review_{key}", help="Quiz yourself on this problem's takeaway"):
+                    review_takeaway = extract_tag(entry.get("current_solution") or "", "takeaway")
+                    if not review_takeaway:
+                        st.warning("This problem has no saved takeaway to quiz on.")
+                    else:
+                        _start_review(
+                            {
+                                "title": entry.get("title", "Untitled"),
+                                "content": review_takeaway,
+                                "language": entry.get("language", "Python"),
+                            },
+                            user_gemini_key,
+                        )
         else:
             st.caption("Nothing here yet -- generate a solution or hints for a problem to start building history.")
+
+        if st.session_state.get("problem_history"):
+            if st.button("🗑️ Forget my history", use_container_width=True):
+                # Reset the active problem's derived state too -- otherwise
+                # the very next run's _snapshot_current_problem() would
+                # immediately re-snapshot (and re-persist) the still-active
+                # solution, silently undoing the forget.
+                _reset_problem_state()
+                st.session_state.problem_history = {}
+                if st.session_state.get("persistence_available"):
+                    persistence.delete_client_history(persistence.get_db_path(), st.session_state.client_id)
+                    # Clear persisted Socratic rows too -- otherwise the
+                    # bootstrap would resume an exchange belonging to a
+                    # problem the user just asked to forget.
+                    persistence.delete_client_socratic(persistence.get_db_path(), st.session_state.client_id)
+                st.rerun()
+
+    with st.expander("📊 Progress", expanded=False):
+        st.caption("All-time stats from your saved problem history.")
+        # All-time source: the durable DB when it's available (the
+        # in-memory dict is capped at 15 entries and only holds the
+        # current session), else fall back to the in-memory dict.
+        if st.session_state.get("persistence_available"):
+            history_data = persistence.load_problem_history(persistence.get_db_path(), st.session_state.client_id)
+        else:
+            history_data = st.session_state.get("problem_history", {})
+        stats = progress_stats.summarize(history_data)
+        if stats["total"] == 0:
+            st.caption("No problems recorded yet -- solve or get hints on a problem to start building stats.")
+        else:
+            st.metric("Problems solved", stats["solved"])
+            st.metric("Hint-only problems", stats["hints_only"])
+            st.metric("Fix loops / attempts", f"{stats['fix_loop_problems']} / {stats['fix_attempts']}")
+            st.metric("Verified ✓", stats["verified_ok"])
+            if stats["languages"]:
+                language_summary = ", ".join(f"{lang} × {n}" for lang, n in sorted(stats["languages"].items()))
+                st.caption(f"Languages: {language_summary}")
+            if stats["topics"]:
+                top_topics = sorted(stats["topics"].items(), key=lambda kv: kv[1], reverse=True)[:5]
+                st.caption("Top topics: " + ", ".join(f"{topic} ({n})" for topic, n in top_topics))
 
 # ---------- Dynamic CSS Injection ----------
 bg_color = "#000000" if st.session_state.get("theme") == "AMOLED" else "#0f172a"

@@ -321,6 +321,264 @@ def test_restoring_from_history_brings_back_full_state():
     assert at.session_state["_problem_widget"] == problem_a
 
 
+def test_solution_snapshot_persisted_to_db():
+    """S4: a generated solution must be mirrored to durable storage, not
+    just held in-memory -- this is what makes problem history survive a
+    tab refresh (the DB is keyed by the URL's client id, which a refresh
+    keeps)."""
+    at = _fresh_app()
+    client_id = at.session_state["client_id"]
+    assert at.session_state["persistence_available"] is True
+
+    problem = "Example: Input: nums = [2,7,11,15], target = 9 -> Output: [0,1]"
+    problem_box = next(w for w in at.text_area if w.key == "_problem_widget")
+    problem_box.set_value(problem)
+    at.run()
+    at.session_state["problem_text"] = at.session_state["_problem_widget"]
+    at.session_state["current_solution"] = (
+        "<title>Two Sum</title><problem_statement>x</problem_statement><key_idea>x</key_idea>"
+        "<approach>x</approach><worked_example>x</worked_example><code>```python\nx\n```</code>"
+        "<explanation>x</explanation><complexity>x</complexity><takeaway>t</takeaway>"
+    )
+    at.session_state["raw_code"] = "class Solution: pass"
+    at.run()
+    assert not at.exception
+
+    import persistence
+    loaded = persistence.load_problem_history(persistence.get_db_path(), client_id)
+    assert len(loaded) == 1
+    entry = list(loaded.values())[0]
+    assert entry["title"] == "Two Sum"
+    assert "Two Sum" in entry["current_solution"]
+    assert entry["raw_code"] == "class Solution: pass"
+
+
+def test_forget_history_button_clears_persisted_and_memory():
+    """S4: the 'Forget my history' control must clear both the in-memory
+    dict and the durable copy, so a refresh can't resurrect it (mirroring
+    the lessons Forget button's behavior)."""
+    at = _fresh_app()
+    client_id = at.session_state["client_id"]
+
+    problem = "Example: Input: nums = [2,7,11,15], target = 9 -> Output: [0,1]"
+    problem_box = next(w for w in at.text_area if w.key == "_problem_widget")
+    problem_box.set_value(problem)
+    at.run()
+    at.session_state["problem_text"] = at.session_state["_problem_widget"]
+    at.session_state["current_solution"] = (
+        "<title>Two Sum</title><problem_statement>x</problem_statement><key_idea>x</key_idea>"
+        "<approach>x</approach><worked_example>x</worked_example><code>```python\nx\n```</code>"
+        "<explanation>x</explanation><complexity>x</complexity><takeaway>t</takeaway>"
+    )
+    at.run()
+    assert len(at.session_state["problem_history"]) == 1
+
+    forget_btn = next((b for b in at.button if "Forget my history" in (b.label or "")), None)
+    assert forget_btn is not None, "Forget history button not found in sidebar"
+    forget_btn.click().run()
+    assert not at.exception
+
+    assert at.session_state["problem_history"] == {}
+    import persistence
+    assert persistence.load_problem_history(persistence.get_db_path(), client_id) == {}
+
+
+def test_history_hydrates_across_sessions_for_same_client_id(monkeypatch):
+    """S5: history persisted in one session must be hydrated by a fresh
+    session with the same client id (simulating a tab refresh, which
+    keeps the ?cid= URL param). AppTest has no query_params API, so
+    persistence.new_client_id is patched to a fixed value to make both
+    sessions mint the same id."""
+    import persistence
+    monkeypatch.setattr(persistence, "new_client_id", lambda: "testclientid0001")
+
+    # Session A: work a problem so a snapshot is persisted.
+    at = _fresh_app()
+    assert at.session_state["client_id"] == "testclientid0001"
+    problem = "Example: Input: nums = [2,7,11,15], target = 9 -> Output: [0,1]"
+    problem_box = next(w for w in at.text_area if w.key == "_problem_widget")
+    problem_box.set_value(problem)
+    at.run()
+    at.session_state["problem_text"] = at.session_state["_problem_widget"]
+    at.session_state["current_solution"] = (
+        "<title>Two Sum</title><problem_statement>x</problem_statement><key_idea>x</key_idea>"
+        "<approach>x</approach><worked_example>x</worked_example><code>```python\nx\n```</code>"
+        "<explanation>x</explanation><complexity>x</complexity><takeaway>t</takeaway>"
+    )
+    at.run()
+    assert not at.exception
+
+    # Session B: fresh session, same client id -> history is hydrated.
+    at2 = _fresh_app()
+    assert at2.session_state["client_id"] == "testclientid0001"
+    assert len(at2.session_state["problem_history"]) == 1
+    entry = list(at2.session_state["problem_history"].values())[0]
+    assert entry["title"] == "Two Sum"
+
+    # The sidebar restore button must exist for the hydrated entry.
+    key = list(at2.session_state["problem_history"].keys())[0]
+    restore_btn = next((b for b in at2.button if b.key == f"restore_{key}"), None)
+    assert restore_btn is not None, "restore button for hydrated history entry not found"
+
+
+def test_socratic_exchange_resumes_after_refresh(monkeypatch):
+    """S6: an in-progress Socratic exchange must survive a tab refresh --
+    a fresh session with the same client id restores the pending
+    question, the conversation so far, and the problem it belongs to."""
+    import persistence
+    monkeypatch.setattr(persistence, "new_client_id", lambda: "testclientid0002")
+
+    at = _fresh_app()
+    problem = "Example: Input: nums = [2,7,11,15], target = 9 -> Output: [0,1]"
+    problem_box = next(w for w in at.text_area if w.key == "_problem_widget")
+    problem_box.set_value(problem)
+    at.run()
+    at.session_state["problem_text"] = at.session_state["_problem_widget"]
+    at.session_state["socratic_pending_question"] = "What would you check by hand first?"
+    at.session_state["socratic_conversation"] = [
+        {"question": "What does the example tell you?", "answer": "check pairs"}
+    ]
+    at.session_state["socratic_done"] = False
+    at.run()
+    assert not at.exception
+
+    at2 = _fresh_app()
+    assert at2.session_state["client_id"] == "testclientid0002"
+    assert at2.session_state["socratic_pending_question"] == "What would you check by hand first?"
+    assert len(at2.session_state["socratic_conversation"]) == 1
+    assert at2.session_state["problem_text"] == problem
+    assert at2.session_state["_problem_widget"] == problem
+
+
+def test_review_flow_generates_question_and_feedback(monkeypatch):
+    """R3: the full Recall Review loop -- pick a saved lesson, generate a
+    question, answer it, get feedback -- works end to end through the
+    real app with a stubbed AI."""
+    import ai_client
+
+    call_count = {"n": 0}
+
+    def _fake_call_ai(prompt, user_key=None):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            text = "<question>What data structure stores what you've seen for O(1) lookups?</question>"
+        else:
+            text = "<feedback>Yes! A hash map gives O(1) lookups.</feedback>"
+        return ai_client.AIResult(text=text, provider="fake-model", notices=[])
+
+    monkeypatch.setattr(ai_client, "call_ai", _fake_call_ai)
+
+    at = _fresh_app()
+    # Seed a saved lesson directly (the save flow is covered elsewhere);
+    # must be set after the first run so the bootstrap's DB load doesn't
+    # overwrite it.
+    at.session_state["lessons_memory"] = [
+        {"title": "Two Sum", "takeaway": "Use a hash map for O(1) lookups", "tags": ["Hash Map"], "language": "Python"}
+    ]
+    at.run()
+    assert not at.exception
+
+    quiz_btn = next((b for b in at.button if "Generate review question" in (b.label or "")), None)
+    assert quiz_btn is not None, "Review quiz button not found"
+    quiz_btn.click().run()
+    assert not at.exception
+    assert at.session_state["review_question"] == "What data structure stores what you've seen for O(1) lookups?"
+
+    answer_box = next((w for w in at.text_area if w.key == "review_answer_box"), None)
+    assert answer_box is not None, "review answer box not found"
+    answer_box.set_value("A hash map")
+    submit_btn = next((b for b in at.button if "Submit answer" in (b.label or "")), None)
+    assert submit_btn is not None, "review submit button not found"
+    submit_btn.click().run()
+    assert not at.exception
+    assert at.session_state["review_feedback"] is not None
+    assert "hash map" in at.session_state["review_feedback"].lower()
+    assert call_count["n"] == 2
+
+
+def test_review_quiz_respects_exhausted_session_call_cap():
+    """R3 regression: the review quiz is an AI-call site and must respect
+    the per-session call cap like every other one (mirrors the fix-loop
+    cap test) -- no question is generated when the cap is exhausted."""
+    at = _fresh_app()
+    at.session_state["session_ai_calls"] = 5  # SESSION_AI_CALL_LIMIT, already exhausted
+    at.session_state["lessons_memory"] = [
+        {"title": "Two Sum", "takeaway": "Use a hash map", "tags": [], "language": "Python"}
+    ]
+    at.run()
+    assert not at.exception
+
+    quiz_btn = next((b for b in at.button if "Generate review question" in (b.label or "")), None)
+    quiz_btn.click().run()
+    assert not at.exception
+    assert at.session_state["review_question"] is None
+
+
+def test_review_past_problem_from_history_button(monkeypatch):
+    """R4: the Review button in the Problem History expander kicks off the
+    same recall flow as saved lessons, using the problem's stored
+    <takeaway> as the quiz content."""
+    import ai_client
+
+    def _fake_call_ai(prompt, user_key=None):
+        return ai_client.AIResult(
+            text="<question>What was the key idea again?</question>",
+            provider="fake-model", notices=[],
+        )
+
+    monkeypatch.setattr(ai_client, "call_ai", _fake_call_ai)
+
+    at = _fresh_app()
+    problem = "Example: Input: nums = [2,7,11,15], target = 9 -> Output: [0,1]"
+    problem_box = next(w for w in at.text_area if w.key == "_problem_widget")
+    problem_box.set_value(problem)
+    at.run()
+    at.session_state["problem_text"] = at.session_state["_problem_widget"]
+    at.session_state["current_solution"] = (
+        "<title>Two Sum</title><problem_statement>x</problem_statement><key_idea>x</key_idea>"
+        "<approach>x</approach><worked_example>x</worked_example><code>```python\nx\n```</code>"
+        "<explanation>x</explanation><complexity>x</complexity>"
+        "<takeaway>Use a hash map for O(1) lookups.</takeaway>"
+    )
+    at.run()
+    assert len(at.session_state["problem_history"]) == 1
+
+    history_key = list(at.session_state["problem_history"].keys())[0]
+    review_btn = next((b for b in at.button if b.key == f"review_{history_key}"), None)
+    assert review_btn is not None, "history review button not found"
+    review_btn.click().run()
+    assert not at.exception
+    assert at.session_state["review_question"] == "What was the key idea again?"
+    assert at.session_state["review_source"]["title"] == "Two Sum"
+    assert "hash map" in at.session_state["review_source"]["content"]
+
+
+def test_progress_dashboard_renders_stats_from_history():
+    """D2: the Progress expander renders (with a sensible empty state on
+    a fresh session), and shows real stats once a problem has been solved
+    -- reading the all-time source, the persisted DB."""
+    at = _fresh_app()
+    assert not at.exception  # empty-state render must not crash
+
+    problem = "Example: Input: nums = [2,7,11,15], target = 9 -> Output: [0,1]"
+    problem_box = next(w for w in at.text_area if w.key == "_problem_widget")
+    problem_box.set_value(problem)
+    at.run()
+    at.session_state["problem_text"] = at.session_state["_problem_widget"]
+    at.session_state["current_solution"] = (
+        "<title>Two Sum</title><problem_statement>x</problem_statement><key_idea>x</key_idea>"
+        "<approach>x</approach><worked_example>x</worked_example><code>```python\nx\n```</code>"
+        "<explanation>x</explanation><complexity>x</complexity><takeaway>t</takeaway>"
+    )
+    at.run()
+    assert len(at.session_state["problem_history"]) == 1
+
+    metric_labels = [m.label for m in at.metric]
+    assert any("Problems solved" in str(label) for label in metric_labels)
+    solved_metric = next(m for m in at.metric if m.label == "Problems solved")
+    assert solved_metric.value == "1"
+
+
 def test_socratic_full_conversation_converges_to_hint_tabs(monkeypatch):
     """Integration test for P2.11: exercises a complete Socratic
     conversation -- opening question, student answers, round 2 question,

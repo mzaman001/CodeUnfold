@@ -27,7 +27,10 @@ It runs locally as a Streamlit app and uses free-tier LLM APIs (Groq and Gemini)
 - **Socratic Hint Mode:** The AI asks guiding questions one at a time. It evaluates your answers and converges on the full algorithm only after a few rounds of interaction.
 - **Concept-First Explanations:** Explains data structures and algorithms using real-world analogies before diving into complexity. For example, it explains a hash map as a "phone book where you search by name instead of flipping pages," not just "O(1) lookup."
 - **Code Diff Fix Loop:** Paste your failing LeetCode console output, and the app diagnoses the logic flaw, providing a red/green diff of the necessary changes.
-- **Problem History:** Automatically snapshots your generated solutions and hints into a local SQLite database, so you don't lose them when switching between problems or refreshing the page.
+- **Durable Problem History:** Automatically snapshots your generated solutions and hints into a local SQLite database, so you don't lose them when switching between problems — or refreshing the page. Restore any past problem from the sidebar.
+- **Socratic Session Resume:** If you refresh mid-conversation, the app picks your Socratic exchange back up where it left off.
+- **Recall Review:** Retrieval practice on saved lessons and past problems — the app quizzes you on a takeaway's key idea, then gives specific feedback, so what you learned actually sticks.
+- **Progress Dashboard:** All-time stats from your history: problems solved, hint-only attempts, fix-loop revisions, and your language/topic coverage.
 - **Verified Solutions:** For Python and JavaScript, the generated code is executed locally against the problem's example inputs to verify correctness before it is shown to you.
 
 ## Local Setup
@@ -70,13 +73,13 @@ CodeUnfold is built to be fast, stateless on the server (beyond best-effort SQLi
 - **Strict XML Parsing:** The frontend relies on strictly parsed XML tags from the AI to render multi-tab UI components cleanly.
 - **Input Sanitization:** User inputs (problem text, pasted code, errors) are wrapped in isolated XML tags (`<user_problem>`, `<error_report>`) before hitting the LLM to prevent prompt injection.
 - **Rate Limiting:** Implements a two-layer rate limit: a per-session sliding window (to nudge users) and a global process-wide daily token budget (to protect free-tier quotas).
-- **Session State & SQLite:** Current state is held in Streamlit's in-memory session. Saved lessons and problem history are written to a lightweight local SQLite database keyed to the URL.
+- **Session State & SQLite:** Current state is held in Streamlit's in-memory session. Saved lessons, problem history, and in-progress Socratic exchanges are written to a lightweight local SQLite database keyed to the URL.
 
 For a deeper dive into the module structure, see [`ARCHITECTURE.md`](./ARCHITECTURE.md).
 
 ## Limitations
 
-- **Persistence:** The local SQLite storage is URL-scoped and best-effort. It is not a full account system and will not sync across different browsers or devices.
+- **Persistence:** The local SQLite storage (lessons, problem history, in-progress Socratic exchanges) is URL-scoped and best-effort. It is not a full account system and will not sync across different browsers or devices.
 - **Execution Verification:** `code_verifier.py` uses a simple, timeout-bounded subprocess to check code. **It is not a hardened security sandbox.** It is safe for personal use, but do not expose it to untrusted code execution on a public server.
 - **Language Support for Verification:** Automated test verification only supports Python and JavaScript. For other languages, the app relies on the LLM's self-reported correctness.
 

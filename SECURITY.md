@@ -23,6 +23,10 @@ via `ai_client._sanitize_input()` before being embedded:
 - Code that failed and needs fixing (`<failed_code>`)
 - Pasted LeetCode error output (`<error_report>`)
 - Typed answers during Socratic hint mode
+- Typed answers during Recall Review (`<student_answer>`)
+- Saved lesson / past-problem takeaways injected into Recall Review
+  prompts (`<lesson_memory>` -- user-influenced content, so it gets the
+  same defense-in-depth treatment as directly typed input)
 
 Sanitization does two things: strips the specific closing/opening tag
 the text is about to be wrapped in (so a user can't paste
@@ -98,21 +102,22 @@ adversarial internet users at scale, this needs a real sandbox instead.
 
 ### 6. Lesson persistence (`persistence.py`)
 
-Saved lessons are stored in a local SQLite file, keyed by a random
-client id kept in the page's URL (not a login, not a password -- see
-`persistence.py`'s module docstring and `ARCHITECTURE.md` for the full
-scope). Security-relevant properties:
+Saved lessons, problem history, and in-progress Socratic exchanges are
+stored in a local SQLite file, keyed by a random client id kept in the
+page's URL (not a login, not a password -- see `persistence.py`'s module
+docstring and `ARCHITECTURE.md` for the full scope). Security-relevant
+properties:
 
 - **The client id is a bearer token, effectively.** Anyone who obtains
   a copy of that URL (e.g. it's accidentally shared, logged by a
   proxy, or shoulder-surfed) can view and delete that user's saved
-  lessons. Lessons are LeetCode approach notes, not secrets, but this
-  is still worth knowing before relying on the URL as if it were
-  private.
+  lessons and problem history. This data is LeetCode approach notes,
+  not secrets, but this is still worth knowing before relying on the
+  URL as if it were private.
 - **The database file itself has no encryption at rest and no access
   control beyond the host filesystem's own permissions.** On a shared
   hosting environment, whoever can read the filesystem can read every
-  client's saved lessons.
+  client's saved lessons and history.
 - **Best-effort only.** If the filesystem is read-only or the DB can't
   be initialized, persistence silently disables itself and the app
   falls back to session-only memory (the pre-persistence behavior) --
