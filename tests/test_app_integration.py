@@ -880,6 +880,66 @@ def test_forget_lessons_button_clears_persisted_data(tmp_path, monkeypatch):
     assert persistence.load_lessons_from_db(persistence.get_db_path(), client_id) == []
 
 
+def test_repair_pass_is_capped_when_many_sections_are_flagged(monkeypatch):
+    """Regression test: _repair_result's per-section repair loop previously
+    had no ceiling -- a response that's broadly non-compliant with the
+    teaching rubric (short sections, unglossed jargon) could spend one
+    repair call per flagged section, up to 5-6 extra LLM calls for a
+    single generation. Feeds a deliberately bad response (5 flaggable
+    sections) through the real solve flow and confirms at most
+    MAX_REPAIRS_PER_RESULT repair calls are made, not one per section.
+    """
+    import ai_client
+
+    # All checkable solution sections made deliberately non-compliant:
+    # too short, and/or containing unglossed jargon, and/or (for
+    # worked_example) no traced numeric values -- see
+    # response_parser.find_quality_issues for what each check looks for.
+    bad_response = (
+        "<title>Two Sum</title>"
+        "<problem_statement>Uses a hash map here.</problem_statement>"
+        "<key_idea>Too short.</key_idea>"
+        "<approach>Also too short.</approach>"
+        "<worked_example>We look at each element and compare against what we have seen so far in total, taking each one in turn.</worked_example>"
+        "<code>```python\nclass Solution:\n    def twoSum(self, nums, target):\n        return []\n```</code>"
+        "<explanation>Short too.</explanation>"
+        "<complexity>O(n)</complexity>"
+        "<takeaway>Use a hash map.</takeaway>"
+    )
+
+    def _fake_stream(prompt, user_key=None):
+        yield bad_response
+
+    repair_call_count = {"n": 0}
+
+    def _fake_call_ai(prompt, user_key=None):
+        repair_call_count["n"] += 1
+        return ai_client.AIResult(text="<fixed>Repaired content here.</fixed>", provider="fake-model", notices=[])
+
+    monkeypatch.setattr(ai_client, "call_ai_stream", _fake_stream)
+    monkeypatch.setattr(ai_client, "call_ai", _fake_call_ai)
+
+    at = _fresh_app()
+    problem_box = next(w for w in at.text_area if w.key == "_problem_widget")
+    problem_box.set_value("Example: Input: nums = [2,7,11,15], target = 9 -> Output: [0,1]")
+
+    solve_btn = next(b for b in at.button if "Reveal Solution" in (b.label or ""))
+    solve_btn.click().run()
+
+    assert not at.exception, f"Unhandled exception: {at.exception}"
+    # Deliberately not `import main` here to read MAX_REPAIRS_PER_RESULT --
+    # main.py is a Streamlit script with no `if __name__ == "__main__"`
+    # guard, so a plain import executes it top-to-bottom outside AppTest's
+    # sandboxed run context, which corrupts Streamlit's internal form-
+    # tracking state for the rest of the process (every later
+    # AppTest.from_file() call then falsely reports the language selectbox
+    # as "inside a form"). Asserting the literal cap value instead.
+    assert repair_call_count["n"] <= 3, (
+        f"expected at most 3 repair calls (main.MAX_REPAIRS_PER_RESULT), got {repair_call_count['n']}"
+    )
+    assert repair_call_count["n"] > 0, "test setup didn't actually trigger any repairs -- sections weren't flagged"
+
+
 def test_onboarding_example_buttons_populate_problem_without_crashing():
     """Regression test: clicking either "try it now" example button used to
     crash with a StreamlitAPIException (writing to the `_problem_widget`

@@ -340,6 +340,9 @@ def _call_ai(prompt: str, user_key: str = None) -> str:
     return result.text
 
 
+MAX_REPAIRS_PER_RESULT = 3
+
+
 def _repair_result(result_text: str, extractor, problem_text: str, user_key: str = None) -> str:
     """Runs the free, local teaching-quality heuristic on a just-generated
     tagged response and, only for sections it flags, spends one small
@@ -353,12 +356,26 @@ def _repair_result(result_text: str, extractor, problem_text: str, user_key: str
     response_parser.find_quality_issues and ai_client.build_repair_prompt
     for why this stays cheap: most responses already comply with the
     rubric and trigger zero extra calls.
+
+    Capped at MAX_REPAIRS_PER_RESULT sections: without a ceiling, a
+    response that's broadly non-compliant (a weak fallback model, a bad
+    day) could flag most of a solution's 5-6 checkable sections and spend
+    a repair call on every one of them -- directly working against the
+    token-efficiency goal this whole mechanism exists to serve. Capping
+    means the worst case for one generation is a handful of small calls,
+    not one per section; any sections beyond the cap are left as-is
+    rather than silently retried without limit.
     """
     sections = extractor(result_text)
     if not sections:
         return result_text
     issues = find_quality_issues(sections)
-    for name, section_issues in issues.items():
+    if len(issues) > MAX_REPAIRS_PER_RESULT:
+        log.info(
+            f"AI Info: {len(issues)} sections flagged, capping repair pass at {MAX_REPAIRS_PER_RESULT} "
+            f"(skipped: {', '.join(list(issues)[MAX_REPAIRS_PER_RESULT:])})"
+        )
+    for name, section_issues in list(issues.items())[:MAX_REPAIRS_PER_RESULT]:
         try:
             repair_prompt = build_repair_prompt(
                 name, sections[name], section_issues, problem_text, st.session_state.language
