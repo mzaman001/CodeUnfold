@@ -10,6 +10,7 @@ from persistence import (
     delete_client_lessons, delete_last_lesson, new_client_id, get_db_path, DB_ENV_VAR,
     save_problem_history, load_problem_history, delete_client_history,
     save_socratic_conversation, load_socratic_conversations, delete_client_socratic,
+    load_global_rate_limit, save_global_rate_limit,
 )
 
 
@@ -388,3 +389,26 @@ def test_get_db_path_defaults_next_to_module(monkeypatch):
     monkeypatch.delenv(DB_ENV_VAR, raising=False)
     path = get_db_path()
     assert path.endswith("codeunfold_data.db")
+
+
+def test_global_rate_limit_roundtrip(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    init_db(db_path)
+    assert load_global_rate_limit(db_path) is None  # nothing saved yet
+
+    assert save_global_rate_limit(db_path, "2026-01-01", 5) is True
+    assert load_global_rate_limit(db_path) == ("2026-01-01", 5)
+
+
+def test_global_rate_limit_upsert_overwrites_previous_value(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    init_db(db_path)
+    save_global_rate_limit(db_path, "2026-01-01", 5)
+    save_global_rate_limit(db_path, "2026-01-02", 1)
+    assert load_global_rate_limit(db_path) == ("2026-01-02", 1)
+
+
+def test_global_rate_limit_read_and_write_fail_gracefully_on_bad_path():
+    bad_path = "/nonexistent/dir/does/not/exist.db"
+    assert load_global_rate_limit(bad_path) is None
+    assert save_global_rate_limit(bad_path, "2026-01-01", 1) is False

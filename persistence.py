@@ -110,6 +110,50 @@ def init_db(db_path: str) -> bool:
                     UNIQUE (client_id, problem_key)
                 )"""
             )
+            # Single-row table backing rate_limiter.GlobalRateLimiter's daily
+            # budget. Without this, the budget lived only in an
+            # @st.cache_resource in-memory singleton -- a process restart
+            # (a redeploy, a crash, a platform recycling an idle instance)
+            # silently reset an exhausted daily quota back to full, quietly
+            # widening the very protection this exists to provide. Not a fix
+            # for the documented multi-instance gap (each instance still has
+            # its own file/DB), just for the much more common single-instance
+            # restart case.
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS global_rate_limit (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    day TEXT NOT NULL,
+                    count INTEGER NOT NULL
+                )"""
+            )
+            conn.commit()
+        return True
+    except (sqlite3.Error, OSError):
+        return False
+
+
+def load_global_rate_limit(db_path: str):
+    """Returns (day, count) for the persisted daily call budget, or None
+    if nothing's been saved yet (fresh DB) or the read failed."""
+    try:
+        with _connect(db_path) as conn:
+            row = conn.execute("SELECT day, count FROM global_rate_limit WHERE id = 1").fetchone()
+            return (row[0], row[1]) if row else None
+    except (sqlite3.Error, OSError):
+        return None
+
+
+def save_global_rate_limit(db_path: str, day: str, count: int) -> bool:
+    """Upserts the single global-rate-limit row. Best-effort: a failed
+    write here should degrade to in-memory-only tracking for that call,
+    not crash the request that triggered it."""
+    try:
+        with _connect(db_path) as conn:
+            conn.execute(
+                "INSERT INTO global_rate_limit (id, day, count) VALUES (1, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET day = excluded.day, count = excluded.count",
+                (day, count),
+            )
             conn.commit()
         return True
     except (sqlite3.Error, OSError):

@@ -17,6 +17,7 @@ import streamlit as st
 from rate_limiter import GlobalRateLimiter
 from lesson_memory import select_relevant_lessons, format_lessons_context
 from logger import log
+import persistence
 
 # Server-side hard caps. The Streamlit widgets also set `max_chars`, but
 # that's a client-side widget property only -- a scripted client talking
@@ -61,7 +62,11 @@ MAX_ATTEMPT_ERRORS = 6
 
 @st.cache_resource
 def get_global_limiter() -> GlobalRateLimiter:
-    return GlobalRateLimiter(daily_budget=GLOBAL_DAILY_CALL_BUDGET)
+    # db_path backs the daily count with the same SQLite file lessons/
+    # history already use, so an exhausted budget survives a process
+    # restart instead of silently resetting to full -- see
+    # GlobalRateLimiter's docstring for what this does and doesn't cover.
+    return GlobalRateLimiter(daily_budget=GLOBAL_DAILY_CALL_BUDGET, db_path=persistence.get_db_path())
 
 
 def _enforce_server_side_length(text: str, max_chars: int) -> str:

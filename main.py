@@ -41,6 +41,15 @@ st.set_page_config(page_title="CodeUnfold", page_icon="🤖", layout="wide", ini
 # ---------- CSS ----------
 st.markdown(styles.BASE_CSS, unsafe_allow_html=True)
 
+# Defense-in-depth: the page's URL carries `?cid=...`, the only "identity"
+# session memory has (see persistence.py). Modern browsers already default
+# to a referrer policy that strips the query string on a cross-origin
+# request (e.g. the Google Fonts @import in styles.py), so this isn't
+# closing an active leak -- it's a cheap, explicit guarantee that holds
+# even on older browsers or if a future change adds another third-party
+# resource load.
+st.markdown('<meta name="referrer" content="same-origin">', unsafe_allow_html=True)
+
 
 # Initialize AI clients on start
 _default_gemini, _groq_client = get_clients()
@@ -1037,7 +1046,14 @@ if st.session_state.current_solution:
                         detail = failed[0]["error"] if failed else "output did not match"
                         st.error(f"❌ Ran against the example input — this did **not** match: {detail}")
                     else:
-                        st.caption(f"ℹ️ Not auto-verified: {verification['reason']}.")
+                        # This used to be a st.caption() -- easy to miss next
+                        # to a big confident-looking code block, which risks a
+                        # beginner reading "not checked" as "checked and fine".
+                        # st.warning() is the same visual weight as the
+                        # mismatch case above, on purpose: "we don't know" and
+                        # "it's wrong" both deserve the reader's attention,
+                        # just not the same color.
+                        st.warning(f"⚠️ Not auto-verified: {verification['reason']}. Double-check this one yourself.")
                 st.markdown(sections["code"])
                 st.markdown(sections["explanation"])
             with s_tab4:

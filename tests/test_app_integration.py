@@ -880,6 +880,33 @@ def test_forget_lessons_button_clears_persisted_data(tmp_path, monkeypatch):
     assert persistence.load_lessons_from_db(persistence.get_db_path(), client_id) == []
 
 
+def test_onboarding_example_buttons_populate_problem_without_crashing():
+    """Regression test: clicking either "try it now" example button used to
+    crash with a StreamlitAPIException (writing to the `_problem_widget`
+    text_area's session_state key after that widget had already been
+    instantiated earlier in the same run -- Streamlit forbids this). This
+    was the app's actual onboarding path for a brand-new user and none of
+    the other integration tests exercised these specific buttons (they all
+    fill the problem via `problem_box.set_value(...)` directly), which is
+    exactly how this shipped unnoticed. Covers both example buttons.
+    """
+    at = _fresh_app()
+    assert at.session_state["problem_text"] == ""  # fresh session, welcome screen showing
+
+    two_sum_btn = next(b for b in at.button if "Two Sum" in (b.label or ""))
+    two_sum_btn.click().run()
+    assert not at.exception, f"Two Sum example button crashed: {at.exception}"
+    assert "twoSum" in at.session_state["problem_text"]
+    assert at.session_state["_problem_widget"] == at.session_state["problem_text"]
+
+    at2 = _fresh_app()
+    parens_btn = next(b for b in at2.button if "Valid Parentheses" in (b.label or ""))
+    parens_btn.click().run()
+    assert not at2.exception, f"Valid Parentheses example button crashed: {at2.exception}"
+    assert "isValid" in at2.session_state["problem_text"]
+    assert at2.session_state["_problem_widget"] == at2.session_state["problem_text"]
+
+
 def test_saved_lessons_are_capped_fifo(tmp_path, monkeypatch):
     """Regression test for B17: lessons_memory previously grew without
     bound across a long session. Saving beyond MAX_LESSONS_IN_MEMORY

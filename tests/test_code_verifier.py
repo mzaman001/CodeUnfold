@@ -134,6 +134,32 @@ def test_verify_solution_flags_wrong_python_code():
     assert result["results"][0]["error"] is not None
 
 
+def test_verify_solution_handles_non_ascii_characters_in_code():
+    """Regression test: solution_path.write_text()/harness_path.write_text()
+    previously had no explicit encoding, defaulting to the OS's preferred
+    encoding (cp1252 on Windows) -- any AI-generated comment containing an
+    em dash, smart quote, or similar non-ASCII character (common in
+    AI-generated text) crashed this with UnicodeEncodeError, breaking
+    solution generation outright rather than failing just this one check.
+    Forced utf-8 throughout; this pins that behavior for both the code
+    file and the harness template's own literal-embedded strings.
+    """
+    code_with_unicode = (
+        "class Solution:\n"
+        "    def twoSum(self, nums, target):\n"
+        "        # — use a hash map for O(1) lookups — “like a phone book”\n"
+        "        seen = {}\n"
+        "        for i, n in enumerate(nums):\n"
+        "            if target - n in seen:\n"
+        "                return [seen[target - n], i]\n"
+        "            seen[n] = i\n"
+        "        return []\n"
+    )
+    result = verify_solution(code_with_unicode, "Python", TWO_SUM_PROBLEM)
+    assert result["verified"] is True
+    assert result["passed"] is True
+
+
 def test_verify_solution_no_examples_is_not_verified_not_silently_passed():
     result = verify_solution(CORRECT_TWO_SUM, "Python", "no example here at all")
     assert result["verified"] is False
