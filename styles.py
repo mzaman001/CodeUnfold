@@ -47,8 +47,12 @@ BASE_CSS = """
     @keyframes pulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
     .stSpinner > div > div > div { animation: pulse 1.5s ease-in-out infinite !important; }
 
-    /* Typography Hierarchy */
-    .markdown-text-container h2 {
+    /* Typography Hierarchy for AI-generated teaching content. Targets
+       [data-testid="stMarkdownContainer"] -- the actual wrapper Streamlit
+       1.x emits around every st.markdown() call. (An older selector here,
+       `.markdown-text-container`, matched no element in this Streamlit
+       version, so this whole block was silently inert.) */
+    [data-testid="stMarkdownContainer"] h2 {
         border-left: 4px solid #f59e0b !important;
         padding-left: 12px !important;
         background: rgba(245, 158, 11, 0.05);
@@ -58,12 +62,69 @@ BASE_CSS = """
         margin-bottom: 1rem !important;
         font-size: 1.4rem !important;
     }
-    .markdown-text-container h3 {
+    [data-testid="stMarkdownContainer"] h3 {
         font-family: 'Fira Code', monospace !important;
         font-size: 1.2rem !important;
         color: #e2e8f0 !important;
         margin-top: 1.5rem !important;
         margin-bottom: 0.8rem !important;
+    }
+    /* Body copy: teaching prose is long-form and dense with inline code
+       (variable states, indices) -- generous line-height and a touch
+       more paragraph spacing keeps multi-paragraph explanations scannable
+       instead of a wall of text. */
+    [data-testid="stMarkdownContainer"] p, [data-testid="stMarkdownContainer"] li {
+        line-height: 1.7 !important;
+        font-size: 15px !important;
+    }
+    [data-testid="stMarkdownContainer"] p { margin-bottom: 0.9rem !important; }
+    [data-testid="stMarkdownContainer"] strong { color: #fbbf24 !important; }
+
+    /* Inline code (`i = 0`, `nums[1] = 7`) is where worked-example traces
+       live -- style it distinctly from surrounding prose so the concrete
+       values a beginner needs to track actually pop off the page, the
+       same way the fenced ```code``` blocks already do. */
+    [data-testid="stMarkdownContainer"] code:not(pre code) {
+        font-family: 'Fira Code', monospace !important;
+        background: rgba(245, 158, 11, 0.1) !important;
+        color: #fcd34d !important;
+        padding: 2px 6px !important;
+        border-radius: 4px !important;
+        font-size: 0.9em !important;
+    }
+
+    /* Tabs are the primary navigation for every teaching flow (Overview /
+       Logic / Code / Takeaway, Intuition / Walkthrough / Pseudo-code,
+       etc.) -- give the active tab the same brand accent used elsewhere
+       instead of Streamlit's default low-contrast underline, so it's
+       obvious at a glance which section you're reading. */
+    [data-testid="stTabs"] [data-baseweb="tab-list"] {
+        gap: 4px !important;
+        border-bottom: 1px solid #334155 !important;
+    }
+    [data-testid="stTabs"] button[data-baseweb="tab"] {
+        font-family: 'Inter', sans-serif !important;
+        font-weight: 600 !important;
+        font-size: 14px !important;
+        color: #94a3b8 !important;
+        padding: 10px 18px !important;
+        border-radius: 8px 8px 0 0 !important;
+        transition: all 0.15s ease !important;
+    }
+    [data-testid="stTabs"] button[data-baseweb="tab"]:hover {
+        color: #f8fafc !important;
+        background: rgba(245, 158, 11, 0.06) !important;
+    }
+    [data-testid="stTabs"] button[aria-selected="true"] {
+        color: #f59e0b !important;
+        background: rgba(245, 158, 11, 0.08) !important;
+    }
+    [data-testid="stTabs"] [data-baseweb="tab-highlight"] {
+        background-color: #f59e0b !important;
+        height: 3px !important;
+    }
+    [data-testid="stTabs"] [data-baseweb="tab-panel"] {
+        padding-top: 20px !important;
     }
 
     /* Mobile Responsive */

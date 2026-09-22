@@ -78,6 +78,100 @@ def extract_socratic_question(text: str):
     return extract_tag(text, "question")
 
 
+def replace_tag(text: str, tag: str, new_content: str) -> str:
+    """Replaces the contents of <tag>...</tag> with `new_content`.
+
+    Used to patch a single flagged section after a targeted repair call
+    (see ai_client.build_repair_prompt) without re-serializing the whole
+    tagged response -- a repair spends tokens on one section, not the
+    full solve/hint output. Returns `text` unchanged if the tag isn't
+    found, so a malformed repair can never silently corrupt the response.
+    """
+    pattern = re.compile(rf"(<{tag}>)(.*?)(</{tag}>)", re.DOTALL | re.IGNORECASE)
+    if not pattern.search(text):
+        return text
+    return pattern.sub(lambda m: f"{m.group(1)}\n{new_content}\n{m.group(3)}", text, count=1)
+
+
+# Jargon terms the teaching prompts require to be glossed in plain
+# English the first time they're used. Not exhaustive -- covers the
+# terms most likely to appear unglossed when a model skips the rule
+# under load, per build_pedagogical_hint_prompt's docstring rationale.
+_JARGON_TERMS = [
+    "hash map", "hash set", "pointer", "traversal", "memoization", "amortized",
+    "recursion", "recursive", "dynamic programming", "greedy", "binary search",
+    "two pointer", "sliding window", "big-o", "time complexity", "space complexity",
+    "stack", "queue", "heap", "trie", "topological sort", "backtracking",
+]
+
+# Below this many characters, a section reads as a one-liner rather than
+# the "depth is the goal, terseness is a failure" explanation the
+# teaching prompts demand. Thresholds are deliberately loose (a real
+# floor, not a target) to avoid flagging legitimately short sections.
+MIN_SECTION_CHARS = {
+    "intuition": 220, "key_idea": 200, "approach": 200, "walkthrough": 150,
+    "worked_example": 150, "explanation": 150, "critique": 80, "logic_flaw": 100,
+    "pseudocode": 80, "fix_direction": 80,
+}
+
+
+def find_quality_issues(sections: dict) -> dict:
+    """Cheap, local (no-LLM) heuristics that flag likely rubric violations
+    in an already-parsed section dict.
+
+    This exists to make the repair pass in ai_client/main.py targeted
+    instead of blind: the teaching prompts are already heavily tuned
+    (worked examples, mandatory jargon-glossing, analogy-before-formal-
+    name -- see ai_client.build_pedagogical_hint_prompt), so most
+    responses already comply and a full critique-and-regenerate call on
+    every response would double token cost for no benefit. Running this
+    heuristic first and only spending a follow-up call on the sections it
+    actually flags keeps the common case at zero extra cost.
+
+    Returns {section_name: [issue, ...]} for sections with a problem;
+    sections with none are omitted entirely. Heuristic, not exhaustive --
+    false negatives are expected and fine; the goal is to catch what
+    regularly slips through, not to guarantee compliance.
+    """
+    # Never flag these: "code" is code, not prose (jargon/length rules
+    # don't apply and a "repair" call would risk mangling working code),
+    # and "title"/"complexity"/"takeaway" are meant to be short by design.
+    _EXCLUDED_SECTIONS = {"code", "title", "complexity", "takeaway", "next_question", "feedback"}
+
+    issues = {}
+    for name, text in sections.items():
+        if not text or name in _EXCLUDED_SECTIONS:
+            continue
+        section_issues = []
+
+        min_len = MIN_SECTION_CHARS.get(name)
+        if min_len and len(text) < min_len:
+            section_issues.append(
+                f"too short ({len(text)} chars) -- needs a real beginner-level explanation, not a one-liner"
+            )
+
+        if name in ("worked_example", "walkthrough") and not re.search(r"\d", text):
+            section_issues.append(
+                "no concrete traced values found -- must trace the problem's own example with real numbers, not describe it abstractly"
+            )
+
+        lower = text.lower()
+        for term in _JARGON_TERMS:
+            idx = lower.find(term)
+            if idx == -1:
+                continue
+            tail = text[idx: idx + len(term) + 60]
+            if not any(marker in tail for marker in ("(", "--", "—", " - ")):
+                section_issues.append(
+                    f"uses '{term}' without a nearby plain-English gloss the first time it's used"
+                )
+                break  # one flagged term is enough signal; don't pile on
+
+        if section_issues:
+            issues[name] = section_issues
+    return issues
+
+
 def extract_socratic_followup(text: str):
     """Parses a Socratic follow-up turn.
 

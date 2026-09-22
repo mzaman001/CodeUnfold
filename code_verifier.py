@@ -37,6 +37,7 @@ oversold itself):
 """
 import ast
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -220,19 +221,27 @@ def _run_python_example(code: str, example: dict, tmpdir: Path) -> dict:
     expected = _to_python_literal(example["output"])
 
     solution_path = tmpdir / "solution_module.py"
-    solution_path.write_text(code)
+    solution_path.write_text(code, encoding="utf-8")
 
     harness_code = _PY_HARNESS_TEMPLATE.format(
         solution_dir=str(tmpdir), kwargs=kwargs, method_name=method_name, expected=expected
     )
     harness_path = tmpdir / "harness.py"
-    harness_path.write_text(harness_code)
+    harness_path.write_text(harness_code, encoding="utf-8")
 
     try:
+        # PYTHONIOENCODING forces the child interpreter's own stdout to
+        # UTF-8 -- on Windows it otherwise defaults to the system
+        # codepage (cp1252/"charmap"), which raises UnicodeEncodeError
+        # inside the child the moment generated code's output or an
+        # exception message contains a character outside that codepage
+        # (an em dash, a smart quote, a checkmark -- all common in
+        # AI-generated comments and error text).
         proc = subprocess.run(
             [sys.executable, str(harness_path)],
             capture_output=True, text=True, timeout=TIMEOUT_SECONDS,
-            cwd=str(tmpdir),
+            cwd=str(tmpdir), encoding="utf-8", errors="replace",
+            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         )
     except subprocess.TimeoutExpired:
         return {**example, "passed": False, "error": f"timed out after {TIMEOUT_SECONDS}s"}
@@ -278,7 +287,7 @@ def _run_js_example(code: str, example: dict, tmpdir: Path) -> dict:
     # Best-effort: append a CommonJS export so `require()` can reach the class.
     export_code = code + "\nmodule.exports = typeof Solution !== 'undefined' ? Solution : module.exports;\n"
     solution_path = tmpdir / "solution.js"
-    solution_path.write_text(export_code)
+    solution_path.write_text(export_code, encoding="utf-8")
 
     # json.dumps produces valid JS-literal-compatible JSON regardless of
     # what characters appear in the value (quotes, apostrophes, unicode,
@@ -293,13 +302,13 @@ def _run_js_example(code: str, example: dict, tmpdir: Path) -> dict:
         expected_json=json.dumps(expected),
     )
     harness_path = tmpdir / "harness.js"
-    harness_path.write_text(harness_code)
+    harness_path.write_text(harness_code, encoding="utf-8")
 
     try:
         proc = subprocess.run(
             ["node", "--no-addons", str(harness_path)],
             capture_output=True, text=True, timeout=TIMEOUT_SECONDS,
-            cwd=str(tmpdir),
+            cwd=str(tmpdir), encoding="utf-8", errors="replace",
         )
     except subprocess.TimeoutExpired:
         return {**example, "passed": False, "error": f"timed out after {TIMEOUT_SECONDS}s"}

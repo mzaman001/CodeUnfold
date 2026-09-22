@@ -11,6 +11,7 @@ from ai_client import (
     build_pedagogical_hint_prompt, build_code_review_prompt,
     build_socratic_question_prompt, build_socratic_feedback_prompt,
     build_review_question_prompt, build_review_feedback_prompt,
+    build_repair_prompt,
     SOCRATIC_MAX_TURNS,
     get_clients
 )
@@ -19,6 +20,7 @@ from response_parser import (
     extract_tag, extract_code_block, extract_hint_sections,
     extract_review_sections, extract_solution_sections,
     extract_socratic_question, extract_socratic_followup,
+    find_quality_issues, replace_tag,
 )
 from code_verifier import verify_solution
 from lesson_memory import build_lesson
@@ -95,6 +97,16 @@ _defaults = {
 for key, default in _defaults.items():
     if key not in st.session_state:
         st.session_state[key] = default
+
+# Apply any example-problem text queued by the onboarding "try it now"
+# buttons *before* the `_problem_widget` text_area below is instantiated
+# this run. Streamlit forbids writing to a widget's session_state key
+# after it's already been instantiated in the same run, so those buttons
+# queue the text here and st.rerun() rather than setting the widget key
+# directly -- this is where the queued value actually lands in the widget,
+# on the run after the click, before instantiation happens.
+if "_pending_example_text" in st.session_state:
+    st.session_state["_problem_widget"] = st.session_state.pop("_pending_example_text")
 
 if "ai_limiter" not in st.session_state:
     st.session_state.ai_limiter = RateLimiter(max_calls=15, window_seconds=60)
@@ -317,6 +329,39 @@ def _call_ai(prompt: str, user_key: str = None) -> str:
             st.sidebar.caption(message)
     st.sidebar.caption(f"🤖 Answered by: `{result.provider}`")
     return result.text
+
+
+def _repair_result(result_text: str, extractor, problem_text: str, user_key: str = None) -> str:
+    """Runs the free, local teaching-quality heuristic on a just-generated
+    tagged response and, only for sections it flags, spends one small
+    follow-up call to patch that section in place.
+
+    This is called exactly once per generation, right where the caller
+    is about to store the result into session_state -- not from the
+    display code further down, which reruns on every Streamlit
+    interaction and would otherwise repeat (and re-bill) this check on
+    every rerun for a response that never changes. See
+    response_parser.find_quality_issues and ai_client.build_repair_prompt
+    for why this stays cheap: most responses already comply with the
+    rubric and trigger zero extra calls.
+    """
+    sections = extractor(result_text)
+    if not sections:
+        return result_text
+    issues = find_quality_issues(sections)
+    for name, section_issues in issues.items():
+        try:
+            repair_prompt = build_repair_prompt(
+                name, sections[name], section_issues, problem_text, st.session_state.language
+            )
+            fixed_text = _call_ai(repair_prompt, user_key)
+            fixed = extract_tag(fixed_text, "fixed")
+            if fixed:
+                result_text = replace_tag(result_text, name, fixed)
+                log.info(f"AI Info: Repaired '{name}' section ({'; '.join(section_issues)})")
+        except Exception as e:
+            log.warning(f"AI Warning: Repair pass failed for '{name}' - {str(e)[:100]}")
+    return result_text
 
 
 def _call_ai_streamed(prompt: str, user_key: str = None) -> str:
@@ -710,7 +755,7 @@ Example: Input: nums = [2,7,11,15], target = 9 -> Output: [0,1]
 class Solution:
     def twoSum(self, nums: List[int], target: int) -> List[int]:"""
             st.session_state.problem_text = _text
-            st.session_state["_problem_widget"] = _text
+            st.session_state["_pending_example_text"] = _text
             _reset_problem_state()
             st.rerun()
     with ex_col2:
@@ -722,7 +767,7 @@ Example: Input: s = "()[]{}" -> Output: true
 class Solution:
     def isValid(self, s: str) -> bool:"""
             st.session_state.problem_text = _text
-            st.session_state["_problem_widget"] = _text
+            st.session_state["_pending_example_text"] = _text
             _reset_problem_state()
             st.rerun()
 
@@ -744,6 +789,7 @@ if hint_button and problem_text:
     if user_code_capped and len(user_code_capped.strip()) > 5:
         hint_prompt = build_code_review_prompt(problem_text, user_code_capped, st.session_state.language, _get_lessons_context(problem_text))
         spinner_msg = "Reviewing your code..."
+        hint_extractor = extract_review_sections
     elif st.session_state.socratic_mode:
         # Socratic mode: ask one diagnostic question instead of the full
         # hint breakdown. The answer-submission flow lives further down,
@@ -764,6 +810,7 @@ if hint_button and problem_text:
                 hint_prompt = build_pedagogical_hint_prompt(problem_text, st.session_state.language, _get_lessons_context(problem_text))
                 with st.spinner("Analyzing problem and generating hints..."):
                     result = _call_ai(hint_prompt, user_gemini_key)
+                result = _repair_result(result, extract_hint_sections, problem_text, user_gemini_key)
                 st.session_state.current_hints = result
                 st.session_state.current_solution = None
                 st.rerun()
@@ -774,7 +821,8 @@ if hint_button and problem_text:
         hint_prompt = build_pedagogical_hint_prompt(problem_text, st.session_state.language, _get_lessons_context(problem_text))
         spinner_msg = "Analyzing problem and generating hints..."
         use_streaming = True
-        
+        hint_extractor = extract_hint_sections
+
     try:
         t0 = time.time()
         if use_streaming:
@@ -784,7 +832,8 @@ if hint_button and problem_text:
             with st.spinner(spinner_msg):
                 result = _call_ai(hint_prompt, user_gemini_key)
         t1 = time.time()
-                
+
+        result = _repair_result(result, hint_extractor, problem_text, user_gemini_key)
         result += f"\n\n---\n*⏱️ Hints generated in {t1-t0:.1f}s*"
         st.session_state.current_hints = result
         st.session_state.current_solution = None
@@ -824,6 +873,7 @@ elif solve_button and problem_text:
                 st.session_state.raw_code, st.session_state.language, problem_text
             )
 
+        result = _repair_result(result, extract_solution_sections, problem_text, user_gemini_key)
         st.session_state.current_solution = result.strip()
         st.session_state.current_hints = None
         st.session_state.show_update_alert = False
@@ -860,6 +910,7 @@ if st.session_state.socratic_pending_question and not st.session_state.socratic_
             try:
                 with st.spinner("Analyzing problem and generating hints..."):
                     result = _call_ai(build_pedagogical_hint_prompt(problem_text, st.session_state.language, _get_lessons_context(problem_text)), user_gemini_key)
+                result = _repair_result(result, extract_hint_sections, problem_text, user_gemini_key)
                 st.session_state.current_hints = result
                 st.session_state.current_solution = None
                 st.session_state.socratic_pending_question = None
@@ -902,6 +953,7 @@ if st.session_state.socratic_pending_question and not st.session_state.socratic_
                     elif parsed["kind"] == "converged":
                         conversation_so_far[-1]["feedback"] = parsed["feedback"]
                         st.session_state.socratic_conversation = conversation_so_far
+                        fb_result = _repair_result(fb_result, extract_hint_sections, problem_text, user_gemini_key)
                         st.session_state.current_hints = fb_result
                         st.session_state.current_solution = None
                         st.session_state.socratic_pending_question = None

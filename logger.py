@@ -22,14 +22,27 @@ def setup_logging():
         # deployment would otherwise grow codeunfold.log without bound.
         try:
             log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'codeunfold.log')
-            fh = RotatingFileHandler(log_file, maxBytes=1_000_000, backupCount=3)
+            # encoding="utf-8" is required on Windows -- without it this
+            # defaults to the system codepage (cp1252), which raises
+            # UnicodeEncodeError the moment a logged message contains a
+            # character outside it (common in AI-generated text: em
+            # dashes, smart quotes, arrows).
+            fh = RotatingFileHandler(log_file, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
             fh.setFormatter(formatter)
             logger.addHandler(fh)
         except OSError:
             pass
 
-        # Console handler
+        # Console handler. errors="backslashreplace" on the stream itself
+        # means a stray unencodable character degrades to an escaped
+        # sequence in the console instead of crashing the request that
+        # triggered the log line -- logging should never be why a feature
+        # breaks.
         ch = logging.StreamHandler()
+        try:
+            ch.stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError):
+            pass
         ch.setFormatter(formatter)
         logger.addHandler(ch)
     
