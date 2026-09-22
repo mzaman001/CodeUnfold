@@ -1,0 +1,40 @@
+﻿name: CI Quality & Security Scan
+
+on:
+  pull_request:
+    branches: [ main, master ]
+  push:
+    branches: [ main, master ]
+
+jobs:
+  semgrep:
+    name: Semgrep SAST Scan
+    runs-on: ubuntu-latest
+    container:
+      image: returntocorp/semgrep
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Run Semgrep Rules
+        run: semgrep scan --config auto --error
+
+  test-and-audit:
+    name: Pytest & Pip-Audit Vulnerability Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+      - name: Run Ruff Lint
+        run: ruff check .
+      - name: Run Pytest Test Suite
+        run: pytest -v
+      - name: Run Pip-Audit Dependency Scan
+        run: pip-audit
