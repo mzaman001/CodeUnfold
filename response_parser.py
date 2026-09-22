@@ -106,27 +106,43 @@ _JARGON_TERMS = [
 
 # Below this many characters, a section reads as a one-liner rather than
 # the "depth is the goal, terseness is a failure" explanation the
-# teaching prompts demand. Thresholds are deliberately loose (a real
-# floor, not a target) to avoid flagging legitimately short sections.
+# Beginner/Intermediate teaching prompts demand. Thresholds are
+# deliberately loose (a real floor, not a target) to avoid flagging
+# legitimately short sections.
 MIN_SECTION_CHARS = {
     "intuition": 220, "key_idea": 200, "approach": 200, "walkthrough": 150,
     "worked_example": 150, "explanation": 150, "critique": 80, "logic_flaw": 100,
     "pseudocode": 80, "fix_direction": 80,
 }
 
+# Advanced mode's prompts explicitly ask for concise, insight-focused
+# answers with no beginner padding -- holding that mode to the same floor
+# as Beginner/Intermediate would flag correct, on-rubric responses as
+# "too short" and burn repair calls fixing something that wasn't broken.
+ADVANCED_MIN_SECTION_CHARS = {name: max(40, threshold // 2) for name, threshold in MIN_SECTION_CHARS.items()}
 
-def find_quality_issues(sections: dict) -> dict:
+
+def find_quality_issues(sections: dict, skill_level: str = "Intermediate") -> dict:
     """Cheap, local (no-LLM) heuristics that flag likely rubric violations
-    in an already-parsed section dict.
+    in an already-parsed section dict, for the given skill level's rubric.
 
     This exists to make the repair pass in ai_client/main.py targeted
     instead of blind: the teaching prompts are already heavily tuned
-    (worked examples, mandatory jargon-glossing, analogy-before-formal-
-    name -- see ai_client.build_pedagogical_hint_prompt), so most
-    responses already comply and a full critique-and-regenerate call on
-    every response would double token cost for no benefit. Running this
-    heuristic first and only spending a follow-up call on the sections it
-    actually flags keeps the common case at zero extra cost.
+    (worked examples, mandatory jargon-glossing at Beginner/Intermediate,
+    analogy-before-formal-name -- see ai_client.build_pedagogical_hint_prompt
+    and ai_client._teaching_profile), so most responses already comply and
+    a full critique-and-regenerate call on every response would double
+    token cost for no benefit. Running this heuristic first and only
+    spending a follow-up call on the sections it actually flags keeps the
+    common case at zero extra cost.
+
+    skill_level changes what "compliant" means, not just how strict the
+    check is: at "Advanced", *not* glossing jargon is correct behavior
+    (see ai_client's Advanced profile), so the jargon check is skipped
+    entirely rather than just loosened -- running it anyway would flag,
+    and then "repair", exactly the concise answers Advanced mode is
+    supposed to produce. Length thresholds are similarly relaxed for
+    Advanced rather than shared with Beginner/Intermediate.
 
     Returns {section_name: [issue, ...]} for sections with a problem;
     sections with none are omitted entirely. Heuristic, not exhaustive --
@@ -138,16 +154,20 @@ def find_quality_issues(sections: dict) -> dict:
     # and "title"/"complexity"/"takeaway" are meant to be short by design.
     _EXCLUDED_SECTIONS = {"code", "title", "complexity", "takeaway", "next_question", "feedback"}
 
+    is_advanced = skill_level == "Advanced"
+    min_chars = ADVANCED_MIN_SECTION_CHARS if is_advanced else MIN_SECTION_CHARS
+
     issues = {}
     for name, text in sections.items():
         if not text or name in _EXCLUDED_SECTIONS:
             continue
         section_issues = []
 
-        min_len = MIN_SECTION_CHARS.get(name)
+        min_len = min_chars.get(name)
         if min_len and len(text) < min_len:
+            depth_label = "concise but substantive" if is_advanced else "beginner-level"
             section_issues.append(
-                f"too short ({len(text)} chars) -- needs a real beginner-level explanation, not a one-liner"
+                f"too short ({len(text)} chars) -- needs a real {depth_label} explanation, not a one-liner"
             )
 
         if name in ("worked_example", "walkthrough") and not re.search(r"\d", text):
@@ -155,17 +175,18 @@ def find_quality_issues(sections: dict) -> dict:
                 "no concrete traced values found -- must trace the problem's own example with real numbers, not describe it abstractly"
             )
 
-        lower = text.lower()
-        for term in _JARGON_TERMS:
-            idx = lower.find(term)
-            if idx == -1:
-                continue
-            tail = text[idx: idx + len(term) + 60]
-            if not any(marker in tail for marker in ("(", "--", "—", " - ")):
-                section_issues.append(
-                    f"uses '{term}' without a nearby plain-English gloss the first time it's used"
-                )
-                break  # one flagged term is enough signal; don't pile on
+        if not is_advanced:
+            lower = text.lower()
+            for term in _JARGON_TERMS:
+                idx = lower.find(term)
+                if idx == -1:
+                    continue
+                tail = text[idx: idx + len(term) + 60]
+                if not any(marker in tail for marker in ("(", "--", "—", " - ")):
+                    section_issues.append(
+                        f"uses '{term}' without a nearby plain-English gloss the first time it's used"
+                    )
+                    break  # one flagged term is enough signal; don't pile on
 
         if section_issues:
             issues[name] = section_issues

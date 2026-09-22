@@ -723,6 +723,49 @@ def test_socratic_max_turns_is_configurable():
     assert at.session_state["socratic_max_turns"] == 4
 
 
+def test_skill_level_selector_defaults_to_intermediate_and_is_settable():
+    at = _fresh_app()
+
+    radio = next((w for w in at.radio if w.key == "skill_level"), None)
+    assert radio is not None, "Skill Level radio not found in sidebar"
+    assert radio.value == "Intermediate"
+    assert set(radio.options) == {"Beginner", "Intermediate", "Advanced"}
+
+    radio.set_value("Advanced").run()
+    assert not at.exception
+    assert at.session_state["skill_level"] == "Advanced"
+
+
+def test_skill_level_reaches_the_solve_prompt(monkeypatch):
+    """End-to-end confirmation that the sidebar skill-level setting
+    actually reaches the generated prompt, not just session_state --
+    catches the class of bug where a setting exists in the UI but no call
+    site was ever updated to read it.
+    """
+    import ai_client
+
+    captured_prompts = []
+
+    def _fake_stream(prompt, user_key=None):
+        captured_prompts.append(prompt)
+        yield "<title>x</title>"
+
+    monkeypatch.setattr(ai_client, "call_ai_stream", _fake_stream)
+
+    at = _fresh_app()
+    radio = next(w for w in at.radio if w.key == "skill_level")
+    radio.set_value("Advanced").run()
+
+    problem_box = next(w for w in at.text_area if w.key == "_problem_widget")
+    problem_box.set_value("Example: Input: nums = [2,7,11,15], target = 9 -> Output: [0,1]")
+
+    solve_btn = next(b for b in at.button if "Reveal Solution" in (b.label or ""))
+    solve_btn.click().run()
+
+    assert captured_prompts, "solve flow never reached call_ai_stream"
+    assert "Do NOT define standard CS/algorithm vocabulary" in captured_prompts[0]
+
+
 def test_first_run_key_textbox_actually_wires_up_the_key(monkeypatch):
     """Regression test for B6: the first-run "no API keys configured"
     screen's textbox used to capture the typed key into a local variable

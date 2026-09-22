@@ -160,3 +160,33 @@ def test_find_quality_issues_never_flags_excluded_sections():
 
 def test_find_quality_issues_ignores_falsy_sections():
     assert find_quality_issues({"intuition": None, "walkthrough": ""}) == {}
+
+
+# ---------- skill-level parameterization ----------
+
+def test_find_quality_issues_advanced_does_not_flag_unglossed_jargon():
+    """Advanced mode's prompts explicitly ask for NOT glossing jargon --
+    running the Intermediate/Beginner jargon check against it would flag
+    (and then "repair") exactly the correct, on-rubric behavior."""
+    text = (
+        "We use a hash map to solve this efficiently. " * 3
+        + "It avoids scanning the whole list every time we check a value against the rest."
+    )
+    assert find_quality_issues({"key_idea": text}, skill_level="Advanced") == {}
+    # Same text, Intermediate rubric -- still flagged, confirming this is
+    # a skill_level effect and not a change to the underlying check.
+    assert "key_idea" in find_quality_issues({"key_idea": text}, skill_level="Intermediate")
+
+
+def test_find_quality_issues_advanced_uses_a_lower_length_floor():
+    """Advanced responses are intentionally more concise -- a length that
+    would be flagged as "too short" for Beginner/Intermediate must not be
+    flagged under the Advanced rubric."""
+    medium_length_text = "x" * 100  # below Intermediate's 200-char floor for key_idea, above Advanced's 100
+    assert "key_idea" in find_quality_issues({"key_idea": medium_length_text}, skill_level="Intermediate")
+    assert find_quality_issues({"key_idea": medium_length_text}, skill_level="Advanced") == {}
+
+
+def test_find_quality_issues_defaults_to_intermediate_rubric():
+    text = "Too short."
+    assert find_quality_issues({"intuition": text}) == find_quality_issues({"intuition": text}, skill_level="Intermediate")

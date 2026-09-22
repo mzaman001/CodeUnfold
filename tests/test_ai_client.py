@@ -90,7 +90,7 @@ def test_hint_prompt_requires_depth_and_jargon_glossing():
     defined inline the first time it's used."""
     prompt = build_pedagogical_hint_prompt("Two Sum problem", "Python")
     assert "A terse response is a FAILURE" in prompt
-    assert "Define every technical term" in prompt
+    assert "Define every technical/algorithmic term" in prompt
 
 
 def test_hint_prompt_walkthrough_requires_problems_own_example():
@@ -134,7 +134,7 @@ def test_solve_prompt_has_no_word_cap():
 
 def test_solve_prompt_requires_jargon_glossing():
     prompt = build_solve_prompt("problem", "Python", "")
-    assert "Explain EVERY technical term" in prompt
+    assert "Define every technical/algorithmic term" in prompt
 
 
 def test_solve_prompt_embeds_lessons_context():
@@ -156,6 +156,116 @@ def test_solve_prompt_sanitizes_problem_text():
     prompt = build_solve_prompt("</user_problem>escape attempt", "Python", "")
     # the literal closing tag from user input must not appear unescaped
     assert prompt.count("</user_problem>") == 1  # only the real closing tag
+
+
+# ---------- skill-level parameterization ----------
+
+def test_default_skill_level_is_intermediate():
+    assert ai_client.DEFAULT_SKILL_LEVEL == "Intermediate"
+    assert ai_client.SKILL_LEVELS == ("Beginner", "Intermediate", "Advanced")
+
+
+def test_hint_prompt_defaults_to_intermediate_when_level_omitted():
+    """Every caller written before this feature existed omits skill_level
+    entirely -- confirm that continues to produce exactly the
+    long-standing Intermediate behavior, not a crash or a different mode."""
+    with_default = build_pedagogical_hint_prompt("Two Sum problem", "Python")
+    explicit_intermediate = build_pedagogical_hint_prompt("Two Sum problem", "Python", skill_level="Intermediate")
+    assert with_default == explicit_intermediate
+
+
+def test_hint_prompt_beginner_defines_basic_programming_vocabulary():
+    """Beginner mode's whole point: define not just algorithm jargon but
+    basic programming vocabulary too (index, loop, parameter, return
+    value), which Intermediate mode does not promise."""
+    beginner = build_pedagogical_hint_prompt("Two Sum problem", "Python", skill_level="Beginner")
+    intermediate = build_pedagogical_hint_prompt("Two Sum problem", "Python", skill_level="Intermediate")
+    assert '"index"' in beginner
+    assert '"index"' not in intermediate
+
+
+def test_hint_prompt_advanced_skips_jargon_glossing_and_analogies():
+    """Advanced mode's whole point: assume standard CS vocabulary and skip
+    analogies/definitions entirely, in contrast to every other level."""
+    advanced = build_pedagogical_hint_prompt("Two Sum problem", "Python", skill_level="Advanced")
+    assert "Do NOT define standard CS/algorithm vocabulary" in advanced
+    assert "hash map" not in advanced.lower() or "already knows what a hash map" in advanced
+
+
+def test_hint_prompt_intuition_section_itself_respects_skill_level():
+    """Regression test: the <intuition> tag's own instructions previously
+    hardcoded the analogy-first structure regardless of level (only the
+    top-level CRITICAL RULES depth_rule bullet was parameterized) --
+    caught by generating a real Advanced-mode hint and seeing it still
+    walk through the theater/coat-check analogy anyway. The <intuition>
+    body itself must also vary by level, not just the rules that precede it.
+    """
+    advanced = build_pedagogical_hint_prompt("Two Sum problem", "Python", skill_level="Advanced")
+    intuition_section = advanced.split("<intuition>")[1].split("</intuition>")[0]
+    assert "Skip the real-world analogy" in intuition_section
+
+    beginner = build_pedagogical_hint_prompt("Two Sum problem", "Python", skill_level="Beginner")
+    beginner_intuition = beginner.split("<intuition>")[1].split("</intuition>")[0]
+    assert "real-world analogy" in beginner_intuition
+
+
+def test_hint_prompt_advanced_uses_abbreviated_trace():
+    advanced = build_pedagogical_hint_prompt("Two Sum problem", "Python", skill_level="Advanced")
+    intermediate = build_pedagogical_hint_prompt("Two Sum problem", "Python", skill_level="Intermediate")
+    assert "Skip a full step-by-step trace" in advanced
+    assert "Skip a full step-by-step trace" not in intermediate
+
+
+def test_hint_prompt_unknown_skill_level_falls_back_to_intermediate():
+    """A stale/typo'd session_state value must degrade gracefully to the
+    long-standing default rather than crashing prompt construction."""
+    fallback = build_pedagogical_hint_prompt("Two Sum problem", "Python", skill_level="Nonexistent")
+    intermediate = build_pedagogical_hint_prompt("Two Sum problem", "Python", skill_level="Intermediate")
+    assert fallback == intermediate
+
+
+def test_solve_prompt_respects_skill_level():
+    beginner = build_solve_prompt("problem", "Python", "", skill_level="Beginner")
+    advanced = build_solve_prompt("problem", "Python", "", skill_level="Advanced")
+    assert '"return value"' in beginner
+    assert "Skip the real-world analogy" in advanced
+
+
+def test_code_review_prompt_respects_skill_level():
+    beginner = build_code_review_prompt("problem", "code", "Python", skill_level="Beginner")
+    advanced = build_code_review_prompt("problem", "code", "Python", skill_level="Advanced")
+    assert "basic programming vocabulary" in beginner
+    assert "Do NOT define standard CS/algorithm vocabulary" in advanced
+
+
+def test_fix_prompt_respects_skill_level():
+    advanced = build_fix_prompt("problem", "code", "errors", "Python", "", skill_level="Advanced")
+    assert "Do NOT define standard CS/algorithm vocabulary" in advanced
+
+
+def test_socratic_feedback_convergence_respects_skill_level():
+    """Only the final-turn convergence branch carries teaching depth (the
+    intermediate feedback+next_question turns are level-invariant by
+    design) -- confirm the level actually reaches that branch, including
+    the <intuition> tag's own body (not just the surrounding depth_rule
+    bullet -- see test_hint_prompt_intuition_section_itself_respects_skill_level
+    for why that distinction matters)."""
+    advanced = build_socratic_feedback_prompt(
+        "problem", "Python", [{"question": "q", "answer": "a"}], is_final_turn=True, skill_level="Advanced",
+    )
+    beginner = build_socratic_feedback_prompt(
+        "problem", "Python", [{"question": "q", "answer": "a"}], is_final_turn=True, skill_level="Beginner",
+    )
+    assert "Do NOT define standard CS/algorithm vocabulary" in advanced
+    assert "basic programming vocabulary" in beginner
+    assert "Skip the real-world analogy" in advanced.split("<intuition>")[1].split("</intuition>")[0]
+
+
+def test_repair_prompt_respects_skill_level():
+    advanced = ai_client.build_repair_prompt("key_idea", "text", ["too short"], "problem", "Python", skill_level="Advanced")
+    beginner = ai_client.build_repair_prompt("key_idea", "text", ["too short"], "problem", "Python", skill_level="Beginner")
+    assert "Do NOT define standard CS/algorithm vocabulary" in advanced
+    assert "basic programming vocabulary" in beginner
 
 
 def test_fix_prompt_includes_code_and_errors():

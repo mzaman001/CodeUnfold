@@ -12,7 +12,7 @@ from ai_client import (
     build_socratic_question_prompt, build_socratic_feedback_prompt,
     build_review_question_prompt, build_review_feedback_prompt,
     build_repair_prompt,
-    SOCRATIC_MAX_TURNS,
+    SOCRATIC_MAX_TURNS, SKILL_LEVELS, DEFAULT_SKILL_LEVEL,
     get_clients
 )
 from rate_limiter import RateLimiter
@@ -91,6 +91,7 @@ _defaults = {
     "attempt_errors": [],
     "verification": None,
     "language": "Python",
+    "skill_level": DEFAULT_SKILL_LEVEL,
     "user_code": "",
     "socratic_mode": False,
     "socratic_max_turns": SOCRATIC_MAX_TURNS,
@@ -369,7 +370,8 @@ def _repair_result(result_text: str, extractor, problem_text: str, user_key: str
     sections = extractor(result_text)
     if not sections:
         return result_text
-    issues = find_quality_issues(sections)
+    skill_level = st.session_state.get("skill_level", DEFAULT_SKILL_LEVEL)
+    issues = find_quality_issues(sections, skill_level)
     if len(issues) > MAX_REPAIRS_PER_RESULT:
         log.info(
             f"AI Info: {len(issues)} sections flagged, capping repair pass at {MAX_REPAIRS_PER_RESULT} "
@@ -378,7 +380,7 @@ def _repair_result(result_text: str, extractor, problem_text: str, user_key: str
     for name, section_issues in list(issues.items())[:MAX_REPAIRS_PER_RESULT]:
         try:
             repair_prompt = build_repair_prompt(
-                name, sections[name], section_issues, problem_text, st.session_state.language
+                name, sections[name], section_issues, problem_text, st.session_state.language, skill_level
             )
             fixed_text = _call_ai(repair_prompt, user_key)
             fixed = extract_tag(fixed_text, "fixed")
@@ -412,8 +414,8 @@ def _trigger_fix_loop(prob_text: str, errors: list, user_key: str = None):
     code_to_fix = st.session_state.raw_code or "(code unavailable)"
     
     fix_prompt = build_fix_prompt(
-        prob_text, code_to_fix, error_history, 
-        st.session_state.language, _get_lessons_context(prob_text)
+        prob_text, code_to_fix, error_history,
+        st.session_state.language, _get_lessons_context(prob_text), st.session_state.skill_level
     )
     
     allowed, limit_msg = check_and_consume_rate_limits(user_key)
@@ -493,6 +495,18 @@ with st.sidebar:
     st.divider()
 
     st.radio("UI Theme", ["AMOLED", "Deep Dark"], key="theme", horizontal=True)
+
+    st.divider()
+
+    st.radio(
+        "🎓 Skill Level", list(SKILL_LEVELS), key="skill_level", horizontal=True,
+        help=(
+            "Changes how much every explanation assumes you already know. "
+            "**Beginner**: defines basic programming vocabulary too (loop, index, return value), not just algorithm terms. "
+            "**Intermediate**: assumes you can code, explains algorithm-specific jargon (hash map, recursion, etc). "
+            "**Advanced**: skips jargon definitions and analogies entirely, goes straight to the non-obvious insight."
+        ),
+    )
 
     st.toggle(
         "🧠 Socratic Hints",
@@ -813,7 +827,10 @@ if hint_button and problem_text:
     user_code_capped = _get_user_code_capped()
     use_streaming = False
     if user_code_capped and len(user_code_capped.strip()) > 5:
-        hint_prompt = build_code_review_prompt(problem_text, user_code_capped, st.session_state.language, _get_lessons_context(problem_text))
+        hint_prompt = build_code_review_prompt(
+            problem_text, user_code_capped, st.session_state.language, _get_lessons_context(problem_text),
+            st.session_state.skill_level,
+        )
         spinner_msg = "Reviewing your code..."
         hint_extractor = extract_review_sections
     elif st.session_state.socratic_mode:
@@ -821,6 +838,10 @@ if hint_button and problem_text:
         # hint breakdown. The answer-submission flow lives further down,
         # in the "Display Socratic Flow" block, since it happens on a
         # follow-up interaction rather than this initial button click.
+        # The opening question itself is deliberately skill-level-invariant
+        # -- see build_socratic_question_prompt's docstring: it works by
+        # getting anyone to reason concretely about the example, not by
+        # testing vocabulary, so there's nothing to vary by level.
         try:
             with st.spinner("Thinking of a question to ask you..."):
                 q_result = _call_ai(build_socratic_question_prompt(problem_text, st.session_state.language, _get_lessons_context(problem_text)), user_gemini_key)
@@ -833,7 +854,10 @@ if hint_button and problem_text:
             else:
                 # Model didn't follow the format -- fall back to the
                 # standard hint flow rather than showing a dead end.
-                hint_prompt = build_pedagogical_hint_prompt(problem_text, st.session_state.language, _get_lessons_context(problem_text))
+                hint_prompt = build_pedagogical_hint_prompt(
+                    problem_text, st.session_state.language, _get_lessons_context(problem_text),
+                    st.session_state.skill_level,
+                )
                 with st.spinner("Analyzing problem and generating hints..."):
                     result = _call_ai(hint_prompt, user_gemini_key)
                 result = _repair_result(result, extract_hint_sections, problem_text, user_gemini_key)
@@ -844,7 +868,9 @@ if hint_button and problem_text:
             _show_error(e, "Socratic question generation")
         st.stop()
     else:
-        hint_prompt = build_pedagogical_hint_prompt(problem_text, st.session_state.language, _get_lessons_context(problem_text))
+        hint_prompt = build_pedagogical_hint_prompt(
+            problem_text, st.session_state.language, _get_lessons_context(problem_text), st.session_state.skill_level
+        )
         spinner_msg = "Analyzing problem and generating hints..."
         use_streaming = True
         hint_extractor = extract_hint_sections
@@ -879,7 +905,9 @@ elif solve_button and problem_text:
     st.session_state.attempt_errors = []
     st.session_state.lesson_saved = False
 
-    solve_prompt = build_solve_prompt(problem_text, st.session_state.language, _get_lessons_context(problem_text))
+    solve_prompt = build_solve_prompt(
+        problem_text, st.session_state.language, _get_lessons_context(problem_text), st.session_state.skill_level
+    )
     
     try:
         t0 = time.time()
@@ -935,7 +963,13 @@ if st.session_state.socratic_pending_question and not st.session_state.socratic_
                 st.stop()
             try:
                 with st.spinner("Analyzing problem and generating hints..."):
-                    result = _call_ai(build_pedagogical_hint_prompt(problem_text, st.session_state.language, _get_lessons_context(problem_text)), user_gemini_key)
+                    result = _call_ai(
+                        build_pedagogical_hint_prompt(
+                            problem_text, st.session_state.language, _get_lessons_context(problem_text),
+                            st.session_state.skill_level,
+                        ),
+                        user_gemini_key,
+                    )
                 result = _repair_result(result, extract_hint_sections, problem_text, user_gemini_key)
                 st.session_state.current_hints = result
                 st.session_state.current_solution = None
@@ -963,7 +997,7 @@ if st.session_state.socratic_pending_question and not st.session_state.socratic_
                         fb_result = _call_ai(
                             build_socratic_feedback_prompt(
                                 problem_text, st.session_state.language, conversation_so_far, is_final_turn,
-                                _get_lessons_context(problem_text),
+                                _get_lessons_context(problem_text), st.session_state.skill_level,
                             ),
                             user_gemini_key,
                         )
