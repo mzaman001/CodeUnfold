@@ -17,9 +17,22 @@ from app_helpers import (
 
 
 @pytest.fixture(autouse=True)
-def reset_global_limiter():
+def reset_global_limiter(tmp_path, monkeypatch):
     """get_global_limiter() is @st.cache_resource -- process-wide, so its
-    internal counter persists across tests unless explicitly cleared."""
+    internal counter persists across tests unless explicitly cleared.
+
+    Since GlobalRateLimiter also persists its count to
+    persistence.get_db_path() (added so an exhausted budget survives a
+    process restart -- see rate_limiter.py), clearing the resource cache
+    alone is no longer enough: a fresh instance still re-hydrates from
+    whatever's on disk. Without CODEUNFOLD_DB_PATH pointed at an isolated
+    tmp file here, every run of this test file was reading/writing the
+    real default codeunfold_data.db sitting next to the source code --
+    across enough repeated local runs in one day, that file's real count
+    eventually exceeds the daily budget, and these tests start failing
+    for a reason that has nothing to do with the code under test.
+    """
+    monkeypatch.setenv("CODEUNFOLD_DB_PATH", str(tmp_path / "test_rate_limit.db"))
     st.cache_resource.clear()
     yield
     st.cache_resource.clear()
